@@ -222,9 +222,13 @@ function extractAllContents(rawText) {
       if (obj.content) {
         contents.push(obj.content);
         console.log("on_arrival found:", obj.info?.id, "content_len:", obj.content.length);
+        if (obj.content.length < 200) console.log("short content:", obj.content);
+      } else {
+        console.log("on_arrival no content, id:", obj.info?.id);
       }
     } catch (e) {
-      console.log("on_arrival parse error:", e.message);
+      console.log("on_arrival parse error:", e.message, "at pos:", jsonStart);
+      console.log("  snippet:", rawText.substring(jsonStart, jsonStart + 100));
     }
     
     searchFrom = jsonEnd;
@@ -367,26 +371,34 @@ async function handleRequest(request, env) {
       if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
 
       const [, , , hash, claseId] = path.split("/");
+      
+      // SIU needs server-side session context. First "prime" by visiting
+      // the asistencia page without claseId (establishes comision context)
+      const primeRes = await gFetch(`asistencias/${hash}`, session, {
+        headers: { "Referer": `${BASE}/zona_clases` }
+      });
+      const primeHtml = await primeRes.text();
+      console.log("Prime response length:", primeHtml.length, "contains alumnos:", primeHtml.includes("alumnos["));
+      
+      // Now fetch the specific class asistencia
       const res = await gFetch(`asistencias/${hash}/${claseId}`, session, {
-        headers: {
-          "Referer": `${BASE}/zona_clases`,
-        }
+        headers: { "Referer": `${BASE}/asistencias/${hash}` }
       });
       const raw = await res.text();
       
       // DEBUG
-      console.log("Asistencia response status:", res.status);
       console.log("Asistencia raw length:", raw.length);
-      console.log("Contains on_arrival:", raw.includes("on_arrival("));
-      console.log("on_arrival count:", (raw.match(/on_arrival\(/g) || []).length);
       console.log("Contains alumnos:", raw.includes("alumnos["));
-      console.log("Raw first 300:", raw.substring(0, 300));
-      console.log("Contains edicion_asistencias:", raw.includes("edicion_asistencias"));
       console.log("Contains box-asistencia:", raw.includes("box-asistencia"));
       
       if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
 
-      const alumnos = parseAlumnos(raw);
+      // Try the primed response first, fall back to direct response
+      let alumnos = parseAlumnos(raw);
+      if (alumnos.length === 0 && primeHtml.includes("alumnos[")) {
+        console.log("Using primed response for alumnos");
+        alumnos = parseAlumnos(primeHtml);
+      }
       console.log("Alumnos:", alumnos.length);
       return Response.json({ alumnos, claseId }, { headers: cors });
     }
