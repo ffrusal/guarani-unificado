@@ -1,0 +1,6 @@
+name = "guarani-unificado-api"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+
+# Para custom domain (opcional):
+# routes = [{ pattern = "api-guarani.ffrusal.workers.dev", custom_domain = true }]
