@@ -256,6 +256,91 @@ function parseCrearForm(rawText) {
   return formMatch ? formMatch[1] : null;
 }
 
+// ── Extract a specific on_arrival by clase_js ──
+function extractOnArrivalByClass(rawText, targetClass) {
+  let html = rawText;
+  try { const outer = JSON.parse(rawText); if (outer.cont) html = outer.cont; } catch (e) {}
+  const marker = "on_arrival(";
+  let searchFrom = 0;
+  while (true) {
+    const idx = html.indexOf(marker, searchFrom);
+    if (idx === -1) break;
+    const jsonStart = idx + marker.length;
+    let depth = 0, inString = false, escape = false, jsonEnd = -1;
+    for (let i = jsonStart; i < html.length; i++) {
+      const ch = html[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"' && !escape) { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      if (ch === '}') { depth--; if (depth === 0) { jsonEnd = i + 1; break; } }
+    }
+    if (jsonEnd === -1) break;
+    try {
+      const obj = JSON.parse(html.substring(jsonStart, jsonEnd));
+      if (obj.clase_js === targetClass) return obj;
+    } catch (e) {}
+    searchFrom = jsonEnd;
+  }
+  return null;
+}
+
+// ── Parse editar_notas page ──
+function parseNotasPage(rawText) {
+  const obj = extractOnArrivalByClass(rawText, "edicion_notas");
+  if (!obj) return null;
+  const info = obj.info || {};
+  const content = obj.content || "";
+
+  // Parse student rows from content
+  const alumnos = [];
+  // Students in SIU edicion_notas have inputs: alumnos[HASH][nota], [resultado], [corregido_por]
+  // And display: nombre, legajo in spans/divs
+  const rowRegex = /class=['"]\s*renglon\s*['"][^>]*>([\s\S]*?)<\/tr>/g;
+  const rows = extractAll(content, rowRegex);
+  for (const row of rows) {
+    const rc = row[1];
+    const hashMatch = rc.match(/alumnos\[([a-f0-9]+)\]/);
+    if (!hashMatch) continue;
+    const hash = hashMatch[1];
+    const nameMatch = rc.match(/class=['"]alumno['"][^>]*>([^<]+)/);
+    const legMatch = rc.match(/class=['"]legajo['"][^>]*>([^<]+)/);
+    const notaMatch = rc.match(/\[nota\]['"][^>]*value=['"]([^'"]*)['"]/);
+    const resMatch = rc.match(/\[resultado\][\s\S]*?selected[^>]*value=['"]([^'"]+)['"]/);
+    alumnos.push({
+      hash,
+      nombre: nameMatch ? nameMatch[1].trim() : "",
+      legajo: legMatch ? legMatch[1].trim() : "",
+      nota: notaMatch ? notaMatch[1] : "",
+      resultado: resMatch ? resMatch[1] : "",
+    });
+  }
+
+  // Fallback: use info.alumnos if content parsing found nothing
+  if (alumnos.length === 0 && Array.isArray(info.alumnos)) {
+    for (const a of info.alumnos) {
+      alumnos.push({
+        hash: a.hash || a.id || "",
+        nombre: a.apellido_nombre || a.nombre || "",
+        legajo: a.legajo || "",
+        nota: a.nota ?? "",
+        resultado: a.resultado || "",
+      });
+    }
+  }
+
+  return {
+    alumnos,
+    evaluacionHash: info.evaluacion || null,
+    escalaId: info.id_escala || "102",
+    resultadoNotas: info.resultado_notas || [],
+    urlGuardar: info.url_guardar || null,
+    urlAgregarComision: info.url_agregar_comision || null,
+    hayAlumnos: content.includes("mensaje_vacio") && content.includes("No hay alumnos") ? false : alumnos.length > 0,
+  };
+}
+
 // ── Routes ──
 async function handleRequest(request, env) {
   const url = new URL(request.url);
@@ -286,22 +371,20 @@ async function handleRequest(request, env) {
       if (!cookieMatch) return Response.json({ error: "Credenciales inválidas" }, { status: 401, headers: cors });
       const session = cookieMatch[1];
 
-      // Switch to Docente profile (critical for users with multiple profiles)
-      // SIU uses a POST to acceso/perfil to switch profiles
-      await gFetch("acceso/perfil", session, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-          "X-Requested-With": "XMLHttpRequest",
-        },
-        body: "perfil=Docente",
-      });
+      // Switch to Docente profile (for users with multiple profiles)
+      // SIU uses GET acceso/perfil?id=Docente → 302 to inicio_docente
+      await gFetch("acceso/perfil?id=Docente", session);
 
       // Verify login + get name
       const vRes = await gFetch("inicio_docente", session);
       const vHtml = await gText(vRes);
+      const isDocente = vHtml.includes("inicio_docente") || vHtml.includes("zona_clases") || vHtml.includes("Bienvenido");
       const nm = vHtml.match(/Bienvenido\s+([^<]+)/);
-      return Response.json({ ok: true, session, nombre: nm ? nm[1].trim() : "Docente" }, { headers: cors });
+      const nombre = nm ? nm[1].trim() : (vHtml.match(/icon-user[^>]*>[^<]*<\/i>\s*([^<]+)/)?.[1]?.trim() || "Docente");
+
+      console.log("Login profile check - isDocente:", isDocente, "url:", vRes.url);
+
+      return Response.json({ ok: true, session, nombre }, { headers: cors });
     }
 
     // ── COMISIONES (Libro de Temas) ──
@@ -628,6 +711,115 @@ async function handleRequest(request, env) {
       }
 
       return Response.json({ results }, { headers: cors });
+    }
+
+    // ── NOTAS: GET editar_notas page ──
+    if (path.match(/^\/api\/notas\/[a-f0-9]+$/) && request.method === "GET") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const cargarHash = path.replace("/api/notas/", "");
+      const res = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+      const raw = await gText(res);
+      if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      const parsed = parseNotasPage(raw);
+      if (!parsed) return Response.json({ error: "No se pudo parsear la página de notas" }, { status: 500, headers: cors });
+      console.log("Notas page: alumnos:", parsed.alumnos.length, "hayAlumnos:", parsed.hayAlumnos);
+      return Response.json(parsed, { headers: cors });
+    }
+
+    // ── NOTAS: agregar alumnos de la comisión ──
+    if (path.match(/^\/api\/notas\/[a-f0-9]+\/agregar-comision$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const cargarHash = path.replace("/api/notas/", "").replace("/agregar-comision", "");
+
+      // First fetch the editar_notas page to get the evaluacion hash and URL
+      const pageRes = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+      const pageRaw = await gText(pageRes);
+      const pageData = parseNotasPage(pageRaw);
+      if (!pageData || !pageData.evaluacionHash) {
+        return Response.json({ error: "No se encontró el hash de evaluación" }, { status: 400, headers: cors });
+      }
+
+      // POST to agregar_comision
+      const addRes = await gFetch("evaluaciones/agregar_comision", session, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+          "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Referer": `${BASE}/evaluaciones/editar_notas/${cargarHash}`,
+        },
+        body: `evaluacion=${pageData.evaluacionHash}`,
+      });
+      const addRaw = await gText(addRes);
+      console.log("Agregar comision response:", addRaw.substring(0, 300));
+
+      // Re-fetch the page to get the updated student list
+      const res2 = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+      const raw2 = await gText(res2);
+      const parsed2 = parseNotasPage(raw2);
+
+      return Response.json({
+        ok: true,
+        alumnos: parsed2?.alumnos || [],
+        evaluacionHash: parsed2?.evaluacionHash || pageData.evaluacionHash,
+        resultadoNotas: parsed2?.resultadoNotas || pageData.resultadoNotas,
+      }, { headers: cors });
+    }
+
+    // ── NOTAS: guardar notas ──
+    if (path.match(/^\/api\/notas\/[a-f0-9]+\/guardar$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const cargarHash = path.replace("/api/notas/", "").replace("/guardar", "");
+      const { evaluacionHash, alumnos } = await request.json();
+      // alumnos: array of { hash, nota, resultado }
+
+      // First fetch the page to get the correct evaluacion hash if not provided
+      let evalHash = evaluacionHash;
+      if (!evalHash) {
+        const pageRes = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+        const pageRaw = await gText(pageRes);
+        const pageData = parseNotasPage(pageRaw);
+        evalHash = pageData?.evaluacionHash;
+      }
+      if (!evalHash) return Response.json({ error: "No evaluacion hash" }, { status: 400, headers: cors });
+
+      // Build form data: evaluacion=HASH&alumnos[HASH][nota]=X&alumnos[HASH][resultado]=Y
+      const params = new URLSearchParams();
+      params.set("evaluacion", evalHash);
+      for (const al of alumnos) {
+        if (al.nota !== "" && al.nota !== undefined) {
+          params.set(`alumnos[${al.hash}][nota]`, al.nota.toString());
+        }
+        if (al.resultado) {
+          params.set(`alumnos[${al.hash}][resultado]`, al.resultado);
+        }
+        if (al.corregido_por) {
+          params.set(`alumnos[${al.hash}][corregido_por]`, al.corregido_por);
+        }
+      }
+
+      const saveRes = await gFetch("evaluaciones/editar_alumnos", session, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+          "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Referer": `${BASE}/evaluaciones/editar_notas/${cargarHash}`,
+        },
+        body: params.toString(),
+      });
+      const saveRaw = await gText(saveRes);
+      console.log("Save notas response:", saveRaw.substring(0, 300));
+
+      try {
+        const result = JSON.parse(saveRaw);
+        return Response.json({ ok: true, result }, { headers: cors });
+      } catch (e) {
+        return Response.json({ ok: saveRes.status === 200, raw: saveRaw.substring(0, 200) }, { headers: cors });
+      }
     }
 
     // ── GRUPOS ──
