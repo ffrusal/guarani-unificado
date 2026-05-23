@@ -49,6 +49,17 @@ export async function login(usuario, password) {
   return data;
 }
 
+export async function loginWithCookie(session) {
+  const data = await apiFetch("/api/login-with-cookie", {
+    method: "POST",
+    body: JSON.stringify({ session }),
+  });
+  setSession(data.session);
+  setUsuario(data.nombre || "docente");
+  setNombre(data.nombre);
+  return data;
+}
+
 export async function getComisionesClases() { return apiFetch("/api/comisiones/clases"); }
 export async function getComisionesParciales() { return apiFetch("/api/comisiones/parciales"); }
 export async function getClases(hash) { return apiFetch(`/api/clases/${hash}`); }

@@ -266,46 +266,110 @@ function CrearEvalModal({ onClose, onCreated, coms }) {
 // ── LOGIN ──
 function Login({ onLogin, dark, setDark }) {
   const t = useTheme();
-  const [user, setUser] = useState("");
-  const [pass, setPass] = useState("");
+  const [cookie, setCookie] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [showHelp, setShowHelp] = useState(false);
+
+  // On mount, check if session was passed via URL (?session=...)
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const urlSession = params.get("session");
+    if (urlSession) {
+      // Clean URL
+      window.history.replaceState({}, "", window.location.pathname);
+      setLoading(true);
+      api.loginWithCookie(urlSession)
+        .then((data) => onLogin(data.nombre, data.session))
+        .catch((e) => { setError(e.message); setLoading(false); });
+    }
+  }, []);
+
   const go = async () => {
-    if (!user || !pass) { setError("Completá usuario y contraseña"); return; }
+    if (!cookie.trim()) { setError("Pegá la cookie de sesión"); return; }
     setLoading(true); setError("");
-    try { const data = await api.login(user, pass); onLogin(data.nombre, data.session); }
-    catch (e) { setError(e.message || "Error al conectar"); }
-    finally { setLoading(false); }
+    try {
+      const data = await api.loginWithCookie(cookie);
+      onLogin(data.nombre, data.session);
+    } catch (e) {
+      setError(e.message || "Error al conectar");
+    } finally { setLoading(false); }
   };
-  const handleKeyDown = (e) => { if (e.key === "Enter") go(); };
+
+  const handleKeyDown = (e) => { if (e.key === "Enter" && e.ctrlKey) go(); };
+
+  // Bookmarklet code that reads cookie and redirects here
+  const appUrl = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}` : "";
+  const bookmarkletCode = `javascript:(function(){var c=document.cookie.split(';').map(s=>s.trim()).find(s=>s.startsWith('siu_sess'));if(!c){alert('No se encontró sesión. ¿Estás logueado en autogestion.usal.edu.ar?');return;}window.open('${appUrl}?session='+encodeURIComponent(c),'_blank');})();`;
+
   return (
-    <div className="min-h-screen flex items-center justify-center relative" style={{ background: t.loginBg }}>
+    <div className="min-h-screen flex items-center justify-center relative py-8" style={{ background: t.loginBg }}>
       <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
       <div className="absolute top-4 right-4">
         <button onClick={() => setDark(!dark)} className="p-2 rounded-lg" style={{ background: t.ghost, color: t.ghostText }}>{dark ? ico.sun : ico.moon}</button>
       </div>
-      <div className="w-full max-w-sm px-4">
-        <div className="text-center mb-7">
+      <div className="w-full max-w-md px-4">
+        <div className="text-center mb-6">
           <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-3" style={{ background: t.loginIconBg, border: `1px solid ${t.greenBorder}` }}>
-            <div style={{ color: t.loginIcon }}><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M4.26 10.147a60.436 60.436 0 00-.491 6.347A48.627 48.627 0 0112 20.904a48.627 48.627 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.57 50.57 0 00-2.658-.813A59.905 59.905 0 0112 3.493a59.902 59.902 0 0110.399 5.84c-.896.248-1.783.52-2.658.814m-15.482 0A50.697 50.697 0 0112 13.489a50.702 50.702 0 017.74-3.342M6.75 15a.75.75 0 100-1.5.75.75 0 000 1.5zm0 0v-3.675A55.378 55.378 0 0112 8.443m-7.007 11.55A5.981 5.981 0 006.75 15.75v-1.5" /></svg></div>
+            <div style={{ color: t.loginIcon }}><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path strokeLinecap="round" strokeLinejoin="round" d="M4.26 10.147a60.436 60.436 0 00-.491 6.347A48.627 48.627 0 0112 20.904a48.627 48.627 0 018.232-4.41 60.46 60.46 0 00-.491-6.347m-15.482 0a50.57 50.57 0 00-2.658-.813A59.905 59.905 0 0112 3.493a59.902 59.902 0 0110.399 5.84c-.896.248-1.783.52-2.658.814m-15.482 0A50.697 50.697 0 0112 13.489a50.702 50.702 0 017.74-3.342" /></svg></div>
           </div>
           <h1 className="text-xl font-bold tracking-tight" style={{ color: t.text }}>Guaraní Unificado</h1>
           <p className="text-xs mt-1" style={{ color: t.textMut }}>Gestión multi-comisión · USAL</p>
         </div>
-        <div className="rounded-2xl p-5 space-y-3" style={{ background: t.loginCard, border: `1px solid ${t.loginCardBorder}`, backdropFilter: "blur(12px)" }}>
+
+        <div className="rounded-2xl p-5 space-y-4" style={{ background: t.loginCard, border: `1px solid ${t.loginCardBorder}`, backdropFilter: "blur(12px)" }}>
           {error && <ErrorBanner message={error} onDismiss={() => setError("")} />}
-          <div>
-            <label className="block text-xs font-medium mb-1" style={{ color: t.textMut }}>Usuario</label>
-            <input type="text" value={user} onChange={(e) => setUser(e.target.value)} onKeyDown={handleKeyDown} placeholder="ej: ffernandezruiz" autoComplete="username"
-              className="w-full px-3 py-2 rounded-lg text-sm outline-none focus:ring-2 focus:ring-green-500/40" style={{ background: t.loginInputBg, border: `1px solid ${t.inputBorder}`, color: t.text }} />
+
+          <div className="space-y-3">
+            <div className="text-xs space-y-2" style={{ color: t.textMut }}>
+              <p style={{ color: t.text }}><strong>USAL ahora usa login con Google.</strong> Necesitás hacer 2 pasos:</p>
+            </div>
+
+            <a href="https://autogestion.usal.edu.ar/autogestion/acceso" target="_blank" rel="noopener noreferrer"
+              className="w-full py-2.5 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-2 transition-all hover:brightness-110 active:scale-[0.98]"
+              style={{ background: "linear-gradient(135deg, #3b82f6, #2563eb)" }}>
+              1️⃣ Abrir autogestion.usal.edu.ar
+            </a>
+
+            <div className="text-xs" style={{ color: t.textMut }}>
+              Iniciá sesión con tu cuenta @usal.edu.ar. Cuando estés adentro, volvé a esta pestaña.
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium mb-1" style={{ color: t.text }}>2️⃣ Pegá la cookie de sesión:</label>
+              <textarea value={cookie} onChange={(e) => setCookie(e.target.value)} onKeyDown={handleKeyDown}
+                placeholder="siu_sess__autogestion_des01=..."
+                rows={2}
+                className="w-full px-3 py-2 rounded-lg text-xs outline-none focus:ring-2 focus:ring-green-500/40 font-mono resize-none"
+                style={{ background: t.loginInputBg, border: `1px solid ${t.inputBorder}`, color: t.text }} />
+              <button onClick={() => setShowHelp(!showHelp)} className="text-xs mt-1 underline" style={{ color: t.greenText }}>
+                {showHelp ? "Ocultar ayuda" : "¿Cómo obtengo la cookie?"}
+              </button>
+            </div>
+
+            {showHelp && (
+              <div className="text-xs space-y-2 px-3 py-2.5 rounded-lg" style={{ background: t.surface, color: t.textSec, border: `1px solid ${t.surfaceBorder}` }}>
+                <p><strong>Opción A — Manual:</strong></p>
+                <ol className="list-decimal ml-4 space-y-0.5">
+                  <li>En la pestaña de autogestion, abrí DevTools (F12)</li>
+                  <li>Pestaña <strong>Application</strong> → <strong>Cookies</strong> → autogestion.usal.edu.ar</li>
+                  <li>Copiá el valor de <code className="px-1 rounded" style={{ background: t.ghost }}>siu_sess__autogestion_des01</code></li>
+                  <li>Pegalo arriba</li>
+                </ol>
+                <p className="pt-2"><strong>Opción B — Bookmarklet (un click):</strong></p>
+                <p>Arrastrá este link a tu barra de favoritos:</p>
+                <a href={bookmarkletCode} onClick={(e) => e.preventDefault()}
+                  className="inline-block px-3 py-1.5 rounded-md text-xs font-semibold"
+                  style={{ background: t.greenBg, color: t.greenText, border: `1px dashed ${t.greenBorder}` }}>
+                  📌 Login Guaraní
+                </a>
+                <p>Después de loguearte en autogestion, clickealo y te traerá acá automáticamente.</p>
+              </div>
+            )}
           </div>
-          <div>
-            <label className="block text-xs font-medium mb-1" style={{ color: t.textMut }}>Contraseña</label>
-            <input type="password" value={pass} onChange={(e) => setPass(e.target.value)} onKeyDown={handleKeyDown} placeholder="••••••••" autoComplete="current-password"
-              className="w-full px-3 py-2 rounded-lg text-sm outline-none focus:ring-2 focus:ring-green-500/40" style={{ background: t.loginInputBg, border: `1px solid ${t.inputBorder}`, color: t.text }} />
-          </div>
-          <button onClick={go} disabled={loading}
-            className="w-full py-2.5 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-2 transition-all hover:brightness-110 active:scale-[0.98] mt-2"
+
+          <button onClick={go} disabled={loading || !cookie.trim()}
+            className="w-full py-2.5 rounded-lg text-sm font-semibold text-white flex items-center justify-center gap-2 transition-all hover:brightness-110 active:scale-[0.98] disabled:opacity-50"
             style={{ background: "linear-gradient(135deg, #22c55e, #16a34a)" }}>
             {loading ? <Spinner size={16} /> : <>{ico.login} Conectar</>}
           </button>
@@ -867,7 +931,8 @@ function Unified({ coms, onBack }) {
                       </button>
                     )}
                     {ev.verCerrarHash && (
-                      <button className="px-2.5 py-1.5 rounded-md text-xs flex items-center gap-1"
+                      <button onClick={() => setSelectedEval({ cargarHash: ev.cargarHash || ev.verCerrarHash, nombre: ev.nombre, readOnly: !ev.cargarHash })}
+                        className="px-2.5 py-1.5 rounded-md text-xs flex items-center gap-1"
                         style={{ background: t.ghost, color: t.ghostText }}>
                         📋 Ver/cerrar
                       </button>
