@@ -506,26 +506,36 @@ function Dash({ onGo }) {
 }
 
 // ── CARGAR NOTAS ──
-function CargarNotas({ cargarHash, evalNombre, onBack }) {
+function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }) {
   const t = useTheme();
   const [loading, setLoading] = useState(true);
   const [alumnos, setAlumnos] = useState([]);
   const [evaluacionHash, setEvaluacionHash] = useState(null);
   const [resultadoNotas, setResultadoNotas] = useState([]);
   const [hayAlumnos, setHayAlumnos] = useState(false);
+  const [readOnly, setReadOnly] = useState(!!forceReadOnly);
+  const [reabrirHash, setReabrirHash] = useState(null);
+  const [cerrarHash, setCerrarHash] = useState(null);
+  const [estado, setEstado] = useState("");
   const [adding, setAdding] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [reopening, setReopening] = useState(false);
+  const [closing, setClosing] = useState(false);
   const [error, setError] = useState("");
 
   const load = async () => {
     setLoading(true); setError("");
     try {
-      const data = await api.getNotas(cargarHash);
+      const data = await api.getNotas(cargarHash, forceReadOnly);
       setAlumnos(data.alumnos || []);
       setEvaluacionHash(data.evaluacionHash);
       setResultadoNotas(data.resultadoNotas || []);
       setHayAlumnos(data.hayAlumnos);
+      setReadOnly(!!data.readOnly);
+      setReabrirHash(data.reabrirHash || null);
+      setCerrarHash(data.cerrarHash || null);
+      setEstado(data.estado || "");
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   };
@@ -545,9 +555,9 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
   };
 
   const setNota = (hash, nota) => {
+    if (readOnly) return;
     setAlumnos((prev) => prev.map((a) => {
       if (a.hash !== hash) return a;
-      // Auto-set resultado based on nota
       let resultado = "";
       if (nota !== "" && resultadoNotas.length > 0) {
         const rn = resultadoNotas.find((r) => r.nota === nota.toString());
@@ -558,14 +568,10 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
     setSaved(false);
   };
 
-  const setResultado = (hash, resultado) => {
-    setAlumnos((prev) => prev.map((a) => a.hash === hash ? { ...a, resultado } : a));
-    setSaved(false);
-  };
-
   const autoAll = (nota) => {
+    if (readOnly) return;
     setAlumnos((prev) => prev.map((a) => {
-      if (a.nota !== "" && a.nota !== undefined) return a; // only fill empty
+      if (a.nota !== "" && a.nota !== undefined) return a;
       const rn = resultadoNotas.find((r) => r.nota === nota.toString());
       return { ...a, nota, resultado: rn ? rn.resultado : "" };
     }));
@@ -584,20 +590,69 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
     finally { setSaving(false); }
   };
 
+  const reabrir = async () => {
+    if (!reabrirHash) return;
+    if (!confirm("¿Reabrir la evaluación? Vas a poder modificar las notas de nuevo.")) return;
+    setReopening(true); setError("");
+    try {
+      await api.reabrirEvaluacion(reabrirHash);
+      await load(); // reload to switch to edit mode
+    } catch (e) { setError(e.message); }
+    finally { setReopening(false); }
+  };
+
+  const cerrar = async () => {
+    if (!cerrarHash) return;
+    if (!confirm("¿Cerrar la evaluación? Una vez cerrada no se podrán modificar las notas (pero se puede reabrir).")) return;
+    setClosing(true); setError("");
+    try {
+      await api.cerrarEvaluacion(cerrarHash);
+      await load();
+    } catch (e) { setError(e.message); }
+    finally { setClosing(false); }
+  };
+
   if (loading) return <LoadingScreen message="Cargando evaluación..." />;
 
   const conNota = alumnos.filter((a) => a.nota !== "" && a.nota !== undefined).length;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 flex-wrap">
         <button onClick={onBack} className="text-xs flex items-center gap-1" style={{ color: t.greenText }}>{ico.back} Volver a parciales</button>
         <h3 className="text-sm font-semibold flex-1" style={{ color: t.text }}>📝 {evalNombre}</h3>
+        {estado && (
+          <span className="px-2 py-0.5 rounded-full text-xs font-medium" style={
+            estado === "Cerrada"
+              ? { background: t.redBg, color: t.redText, boxShadow: `inset 0 0 0 1px ${t.redBorder}` }
+              : { background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
+          }>{estado}</span>
+        )}
+        {readOnly && reabrirHash && (
+          <button onClick={reabrir} disabled={reopening}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
+            style={{ background: t.yellowBg, color: t.yellowText, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }}>
+            {reopening ? <><Spinner size={12} /> Reabriendo...</> : <>🔓 Reabrir</>}
+          </button>
+        )}
+        {!readOnly && cerrarHash && alumnos.length > 0 && (
+          <button onClick={cerrar} disabled={closing}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
+            style={{ background: t.ghost, color: t.ghostText }}>
+            {closing ? <><Spinner size={12} /> Cerrando...</> : <>🔒 Cerrar</>}
+          </button>
+        )}
       </div>
 
       {error && <ErrorBanner message={error} onDismiss={() => setError("")} />}
 
-      {!hayAlumnos && alumnos.length === 0 && (
+      {readOnly && (
+        <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.blueBg, border: `1px solid ${t.blueBorder}`, color: t.blueText }}>
+          <span className="shrink-0 mt-px">{ico.warn}</span> Evaluación cerrada. Las notas son de solo lectura. {reabrirHash && "Podés reabrirla para modificar."}
+        </div>
+      )}
+
+      {!hayAlumnos && alumnos.length === 0 && !readOnly && (
         <div className="text-center py-10 space-y-3">
           <div className="text-3xl">👥</div>
           <p className="text-sm" style={{ color: t.textMut }}>No hay alumnos cargados en esta evaluación.</p>
@@ -609,22 +664,30 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
         </div>
       )}
 
+      {!hayAlumnos && alumnos.length === 0 && readOnly && (
+        <div className="text-center py-10">
+          <p className="text-sm" style={{ color: t.textMut }}>No hay alumnos en esta evaluación.</p>
+        </div>
+      )}
+
       {alumnos.length > 0 && (
         <>
           <div className="flex items-center justify-between flex-wrap gap-2">
             <span className="text-xs" style={{ color: t.textMut }}>
               {conNota}/{alumnos.length} con nota
             </span>
-            <div className="flex items-center gap-1.5">
-              <span className="text-xs" style={{ color: t.textFaint }}>Autocompletar vacíos:</span>
-              {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
-                <button key={n} onClick={() => autoAll(n.toString())}
-                  className="w-7 h-7 rounded text-xs font-medium"
-                  style={n < 4 ? { background: t.redBg, color: t.redText } : { background: t.greenBg, color: t.greenText }}>
-                  {n}
-                </button>
-              ))}
-            </div>
+            {!readOnly && (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs" style={{ color: t.textFaint }}>Autocompletar vacíos:</span>
+                {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+                  <button key={n} onClick={() => autoAll(n.toString())}
+                    className="w-7 h-7 rounded text-xs font-medium"
+                    style={n < 4 ? { background: t.redBg, color: t.redText } : { background: t.greenBg, color: t.greenText }}>
+                    {n}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="space-y-1.5">
@@ -632,30 +695,48 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
               const notaNum = parseInt(a.nota);
               const isAprobado = !isNaN(notaNum) && notaNum >= 4;
               const isDesaprobado = !isNaN(notaNum) && notaNum < 4;
+              const isAusente = a.resultado === "Ausente";
               const hasNota = a.nota !== "" && a.nota !== undefined;
               return (
                 <div key={a.hash} className="px-3 py-2.5 rounded-lg flex items-center justify-between gap-3"
                   style={isDesaprobado ? { background: t.redBg, boxShadow: `inset 0 0 0 1px ${t.redBorder}` }
                     : isAprobado ? { background: t.greenBg, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
+                    : isAusente ? { background: t.yellowBg, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }
                     : { background: t.surface, boxShadow: `inset 0 0 0 1px ${t.surfaceBorder}` }}>
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate" style={{ color: t.text }}>{a.nombre}</div>
-                    {a.legajo && <div className="text-xs" style={{ color: t.textFaint }}>{a.legajo}</div>}
+                    {a.legajo && <div className="text-xs" style={{ color: t.textFaint }}>Legajo: {a.legajo}</div>}
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    <select value={a.nota ?? ""} onChange={(e) => setNota(a.hash, e.target.value)}
-                      className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center outline-none cursor-pointer"
-                      style={{
-                        background: hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.inputBg,
-                        color: hasNota ? (isAprobado ? t.greenText : t.redText) : t.text,
-                        border: `1px solid ${hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.inputBorder}`,
-                      }}>
-                      <option value="" style={{ background: t.optBg }}>—</option>
-                      {[0,1,2,3,4,5,6,7,8,9,10].map((n) => (
-                        <option key={n} value={n.toString()} style={{ background: t.optBg }}>{n}</option>
-                      ))}
-                    </select>
-                    <span className="text-xs w-20 text-center" style={{ color: t.textMut }}>
+                    {readOnly ? (
+                      <div className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center"
+                        style={{
+                          background: hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.ghost,
+                          color: hasNota ? (isAprobado ? t.greenText : t.redText) : t.textMut,
+                          border: `1px solid ${hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.surfaceBorder}`,
+                        }}>
+                        {a.nota || "—"}
+                      </div>
+                    ) : (
+                      <select value={a.nota ?? ""} onChange={(e) => setNota(a.hash, e.target.value)}
+                        className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center outline-none cursor-pointer"
+                        style={{
+                          background: hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.inputBg,
+                          color: hasNota ? (isAprobado ? t.greenText : t.redText) : t.text,
+                          border: `1px solid ${hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.inputBorder}`,
+                        }}>
+                        <option value="" style={{ background: t.optBg }}>—</option>
+                        {[0,1,2,3,4,5,6,7,8,9,10].map((n) => (
+                          <option key={n} value={n.toString()} style={{ background: t.optBg }}>{n}</option>
+                        ))}
+                      </select>
+                    )}
+                    <span className="text-xs w-20 text-center" style={{
+                      color: a.resultado === "Aprobado" ? t.greenText
+                        : a.resultado === "Reprobado" ? t.redText
+                        : a.resultado === "Ausente" ? t.yellowText
+                        : t.textMut
+                    }}>
                       {a.resultado || "—"}
                     </span>
                   </div>
@@ -664,15 +745,17 @@ function CargarNotas({ cargarHash, evalNombre, onBack }) {
             })}
           </div>
 
-          <div className="sticky bottom-4 pt-2">
-            <button onClick={guardar} disabled={saving}
-              className="w-full py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white shadow-lg hover:brightness-110 active:scale-[0.99] transition-all"
-              style={{ background: saved ? "#16a34a" : "linear-gradient(135deg, #22c55e, #16a34a)" }}>
-              {saving ? <><Spinner size={16} /> Guardando notas...</>
-                : saved ? <>{ico.chk} ¡Notas guardadas!</>
-                : <>Guardar notas ({conNota}/{alumnos.length})</>}
-            </button>
-          </div>
+          {!readOnly && (
+            <div className="sticky bottom-4 pt-2">
+              <button onClick={guardar} disabled={saving}
+                className="w-full py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white shadow-lg hover:brightness-110 active:scale-[0.99] transition-all"
+                style={{ background: saved ? "#16a34a" : "linear-gradient(135deg, #22c55e, #16a34a)" }}>
+                {saving ? <><Spinner size={16} /> Guardando notas...</>
+                  : saved ? <>{ico.chk} ¡Notas guardadas!</>
+                  : <>Guardar notas ({conNota}/{alumnos.length})</>}
+              </button>
+            </div>
+          )}
         </>
       )}
     </div>
@@ -864,6 +947,7 @@ function Unified({ coms, onBack }) {
           <CargarNotas
             cargarHash={selectedEval.cargarHash}
             evalNombre={selectedEval.nombre}
+            readOnly={selectedEval.readOnly}
             onBack={() => { setSelectedEval(null); loadEvaluaciones(); }}
           />
         ) :

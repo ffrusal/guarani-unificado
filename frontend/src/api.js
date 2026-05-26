@@ -98,8 +98,9 @@ export async function eliminarGrupo(nombre) {
 }
 
 // ── NOTAS ──
-export async function getNotas(cargarHash) {
-  return apiFetch(`/api/notas/${cargarHash}`);
+export async function getNotas(cargarHash, readOnly = false) {
+  const qs = readOnly ? "?readonly=1" : "";
+  return apiFetch(`/api/notas/${cargarHash}${qs}`);
 }
 
 export async function agregarComisionAEval(cargarHash) {
@@ -111,4 +112,12 @@ export async function guardarNotas(cargarHash, evaluacionHash, alumnos) {
     method: "POST",
     body: JSON.stringify({ evaluacionHash, alumnos }),
   });
+}
+
+export async function reabrirEvaluacion(reabrirHash) {
+  return apiFetch(`/api/notas/${reabrirHash}/reabrir`, { method: "POST" });
+}
+
+export async function cerrarEvaluacion(cerrarHash) {
+  return apiFetch(`/api/notas/${cerrarHash}/cerrar`, { method: "POST" });
 }
