@@ -63,6 +63,7 @@ const ico = {
   cal: <svg width="17" height="17" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>,
   list: <svg width="17" height="17" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M4 6h16M4 10h16M4 14h16M4 18h16" /></svg>,
   plus: <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" /></svg>,
+  edit: <svg width="17" height="17" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>,
 };
 
 function Spinner({ size = 20 }) {
@@ -506,17 +507,15 @@ function Dash({ onGo }) {
 }
 
 // ── CARGAR NOTAS ──
-function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }) {
+function CargarNotas({ items, evalNombre, readOnly: forceReadOnly, onBack }) {
   const t = useTheme();
   const [loading, setLoading] = useState(true);
   const [alumnos, setAlumnos] = useState([]);
-  const [evaluacionHash, setEvaluacionHash] = useState(null);
   const [resultadoNotas, setResultadoNotas] = useState([]);
   const [hayAlumnos, setHayAlumnos] = useState(false);
   const [readOnly, setReadOnly] = useState(!!forceReadOnly);
-  const [reabrirHash, setReabrirHash] = useState(null);
-  const [cerrarHash, setCerrarHash] = useState(null);
-  const [estado, setEstado] = useState("");
+  // Per-comision data: { comisionHash: { evaluacionHash, reabrirHash, cerrarHash, estado, cargarHash } }
+  const [perCom, setPerCom] = useState({});
   const [adding, setAdding] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -527,43 +526,75 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
   const load = async () => {
     setLoading(true); setError("");
     try {
-      const data = await api.getNotas(cargarHash, forceReadOnly);
-      setAlumnos(data.alumnos || []);
-      setEvaluacionHash(data.evaluacionHash);
-      setResultadoNotas(data.resultadoNotas || []);
-      setHayAlumnos(data.hayAlumnos);
-      setReadOnly(!!data.readOnly);
-      setReabrirHash(data.reabrirHash || null);
-      setCerrarHash(data.cerrarHash || null);
-      setEstado(data.estado || "");
+      // Fetch each comision's eval in parallel
+      const results = await Promise.all(items.map(async (it) => {
+        const useHash = it.cargarHash || it.verCerrarHash;
+        const isReadOnly = forceReadOnly || !it.cargarHash;
+        try {
+          const data = await api.getNotas(useHash, isReadOnly);
+          return { item: it, data, ok: true };
+        } catch (e) {
+          return { item: it, error: e.message, ok: false };
+        }
+      }));
+
+      const allAlumnos = [];
+      const perComMap = {};
+      let anyReadOnly = false;
+      let firstResultadoNotas = [];
+      for (const r of results) {
+        if (!r.ok) continue;
+        const d = r.data;
+        if (d.readOnly) anyReadOnly = true;
+        if (d.resultadoNotas?.length && !firstResultadoNotas.length) firstResultadoNotas = d.resultadoNotas;
+        perComMap[r.item.comisionHash] = {
+          cargarHash: r.item.cargarHash || r.item.verCerrarHash,
+          evaluacionHash: d.evaluacionHash,
+          reabrirHash: d.reabrirHash,
+          cerrarHash: d.cerrarHash,
+          estado: d.estado,
+          comisionId: r.item.comisionId,
+        };
+        for (const a of d.alumnos || []) {
+          allAlumnos.push({ ...a, comisionHash: r.item.comisionHash, comisionId: r.item.comisionId });
+        }
+      }
+      // Sort merged list alphabetically
+      allAlumnos.sort((a, b) => (a.nombre || "").localeCompare((b.nombre || ""), "es", { sensitivity: "base" }));
+
+      setAlumnos(allAlumnos);
+      setPerCom(perComMap);
+      setResultadoNotas(firstResultadoNotas);
+      setHayAlumnos(allAlumnos.length > 0);
+      setReadOnly(anyReadOnly || !!forceReadOnly);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
   };
 
-  useEffect(() => { load(); }, [cargarHash]);
+  useEffect(() => { load(); }, []);
 
   const agregarComision = async () => {
+    // Add students to ALL comisiones that have a cargarHash and no students yet
     setAdding(true); setError("");
     try {
-      const data = await api.agregarComisionAEval(cargarHash);
-      setAlumnos(data.alumnos || []);
-      setEvaluacionHash(data.evaluacionHash || evaluacionHash);
-      setResultadoNotas(data.resultadoNotas || resultadoNotas);
-      setHayAlumnos(true);
+      await Promise.all(items.filter((it) => it.cargarHash).map((it) => api.agregarComisionAEval(it.cargarHash).catch(() => null)));
+      await load();
     } catch (e) { setError(e.message); }
     finally { setAdding(false); }
   };
 
-  const setNota = (hash, nota) => {
+  const setNota = (key, val) => {
     if (readOnly) return;
     setAlumnos((prev) => prev.map((a) => {
-      if (a.hash !== hash) return a;
+      if (`${a.comisionHash}:${a.hash}` !== key) return a;
+      // Special sentinel: "AUS" → marca Ausente (sin nota numérica)
+      if (val === "AUS") return { ...a, nota: "", resultado: "Ausente" };
       let resultado = "";
-      if (nota !== "" && resultadoNotas.length > 0) {
-        const rn = resultadoNotas.find((r) => r.nota === nota.toString());
+      if (val !== "" && resultadoNotas.length > 0) {
+        const rn = resultadoNotas.find((r) => r.nota === val.toString());
         resultado = rn ? rn.resultado : "";
       }
-      return { ...a, nota, resultado };
+      return { ...a, nota: val, resultado };
     }));
     setSaved(false);
   };
@@ -572,6 +603,7 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
     if (readOnly) return;
     setAlumnos((prev) => prev.map((a) => {
       if (a.nota !== "" && a.nota !== undefined) return a;
+      if (a.resultado === "Ausente") return a; // no pisar ausentes
       const rn = resultadoNotas.find((r) => r.nota === nota.toString());
       return { ...a, nota, resultado: rn ? rn.resultado : "" };
     }));
@@ -581,32 +613,48 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
   const guardar = async () => {
     setSaving(true); setError(""); setSaved(false);
     try {
-      const data = await api.guardarNotas(cargarHash, evaluacionHash,
-        alumnos.map((a) => ({ hash: a.hash, nota: a.nota, resultado: a.resultado }))
-      );
-      if (data.ok) setSaved(true);
-      else setError("Error al guardar");
+      // Group alumnos by comisionHash, then save to each eval
+      const byCom = {};
+      for (const a of alumnos) {
+        if (!byCom[a.comisionHash]) byCom[a.comisionHash] = [];
+        byCom[a.comisionHash].push({ hash: a.hash, nota: a.nota, resultado: a.resultado });
+      }
+      const results = await Promise.all(Object.entries(byCom).map(async ([comHash, alums]) => {
+        const pc = perCom[comHash];
+        if (!pc) return { ok: false, error: "Comisión no encontrada" };
+        try {
+          const r = await api.guardarNotas(pc.cargarHash, pc.evaluacionHash, alums);
+          return { ok: r.ok, comisionId: pc.comisionId };
+        } catch (e) {
+          return { ok: false, error: e.message, comisionId: pc.comisionId };
+        }
+      }));
+      const failed = results.filter((r) => !r.ok);
+      if (failed.length === 0) setSaved(true);
+      else setError(`Falló el guardado en ${failed.length} comisión(es): ${failed.map((f) => f.comisionId || "?").join(", ")}`);
     } catch (e) { setError(e.message); }
     finally { setSaving(false); }
   };
 
   const reabrir = async () => {
-    if (!reabrirHash) return;
-    if (!confirm("¿Reabrir la evaluación? Vas a poder modificar las notas de nuevo.")) return;
+    const reabribles = Object.values(perCom).filter((p) => p.reabrirHash);
+    if (reabribles.length === 0) return;
+    if (!confirm(`¿Reabrir la evaluación en ${reabribles.length} comisión(es)?`)) return;
     setReopening(true); setError("");
     try {
-      await api.reabrirEvaluacion(reabrirHash);
-      await load(); // reload to switch to edit mode
+      await Promise.all(reabribles.map((p) => api.reabrirEvaluacion(p.reabrirHash).catch(() => null)));
+      await load();
     } catch (e) { setError(e.message); }
     finally { setReopening(false); }
   };
 
   const cerrar = async () => {
-    if (!cerrarHash) return;
-    if (!confirm("¿Cerrar la evaluación? Una vez cerrada no se podrán modificar las notas (pero se puede reabrir).")) return;
+    const cerrables = Object.values(perCom).filter((p) => p.cerrarHash);
+    if (cerrables.length === 0) return;
+    if (!confirm(`¿Cerrar la evaluación en ${cerrables.length} comisión(es)? Se puede reabrir.`)) return;
     setClosing(true); setError("");
     try {
-      await api.cerrarEvaluacion(cerrarHash);
+      await Promise.all(cerrables.map((p) => api.cerrarEvaluacion(p.cerrarHash).catch(() => null)));
       await load();
     } catch (e) { setError(e.message); }
     finally { setClosing(false); }
@@ -614,7 +662,13 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
 
   if (loading) return <LoadingScreen message="Cargando evaluación..." />;
 
-  const conNota = alumnos.filter((a) => a.nota !== "" && a.nota !== undefined).length;
+  const conNota = alumnos.filter((a) => (a.nota !== "" && a.nota !== undefined) || a.resultado === "Ausente").length;
+  const hasReabrir = Object.values(perCom).some((p) => p.reabrirHash);
+  const hasCerrar = Object.values(perCom).some((p) => p.cerrarHash);
+  // Aggregate estado
+  const estados = Object.values(perCom).map((p) => p.estado).filter(Boolean);
+  const estado = estados.length === 0 ? "" : estados.every((e) => e === "Cerrada") ? "Cerrada" : "Abierta";
+  const isMulti = items.length > 1;
 
   return (
     <div className="space-y-4">
@@ -628,18 +682,18 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
               : { background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
           }>{estado}</span>
         )}
-        {readOnly && reabrirHash && (
+        {readOnly && hasReabrir && (
           <button onClick={reabrir} disabled={reopening}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
             style={{ background: t.yellowBg, color: t.yellowText, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }}>
-            {reopening ? <><Spinner size={12} /> Reabriendo...</> : <>🔓 Reabrir</>}
+            {reopening ? <><Spinner size={12} /> Reabriendo...</> : <>🔓 Reabrir{isMulti ? ` (${Object.values(perCom).filter(p=>p.reabrirHash).length})` : ""}</>}
           </button>
         )}
-        {!readOnly && cerrarHash && alumnos.length > 0 && (
+        {!readOnly && hasCerrar && alumnos.length > 0 && (
           <button onClick={cerrar} disabled={closing}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1"
             style={{ background: t.ghost, color: t.ghostText }}>
-            {closing ? <><Spinner size={12} /> Cerrando...</> : <>🔒 Cerrar</>}
+            {closing ? <><Spinner size={12} /> Cerrando...</> : <>🔒 Cerrar{isMulti ? ` (${Object.values(perCom).filter(p=>p.cerrarHash).length})` : ""}</>}
           </button>
         )}
       </div>
@@ -648,7 +702,7 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
 
       {readOnly && (
         <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.blueBg, border: `1px solid ${t.blueBorder}`, color: t.blueText }}>
-          <span className="shrink-0 mt-px">{ico.warn}</span> Evaluación cerrada. Las notas son de solo lectura. {reabrirHash && "Podés reabrirla para modificar."}
+          <span className="shrink-0 mt-px">{ico.warn}</span> Evaluación cerrada. Las notas son de solo lectura. {hasReabrir && "Podés reabrirla para modificar."}
         </div>
       )}
 
@@ -692,40 +746,45 @@ function CargarNotas({ cargarHash, evalNombre, readOnly: forceReadOnly, onBack }
 
           <div className="space-y-1.5">
             {alumnos.map((a) => {
+              const key = `${a.comisionHash}:${a.hash}`;
               const notaNum = parseInt(a.nota);
               const isAprobado = !isNaN(notaNum) && notaNum >= 4;
               const isDesaprobado = !isNaN(notaNum) && notaNum < 4;
               const isAusente = a.resultado === "Ausente";
               const hasNota = a.nota !== "" && a.nota !== undefined;
               return (
-                <div key={a.hash} className="px-3 py-2.5 rounded-lg flex items-center justify-between gap-3"
+                <div key={key} className="px-3 py-2.5 rounded-lg flex items-center justify-between gap-3"
                   style={isDesaprobado ? { background: t.redBg, boxShadow: `inset 0 0 0 1px ${t.redBorder}` }
                     : isAprobado ? { background: t.greenBg, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
                     : isAusente ? { background: t.yellowBg, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }
                     : { background: t.surface, boxShadow: `inset 0 0 0 1px ${t.surfaceBorder}` }}>
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-medium truncate" style={{ color: t.text }}>{a.nombre}</div>
-                    {a.legajo && <div className="text-xs" style={{ color: t.textFaint }}>Legajo: {a.legajo}</div>}
+                    <div className="flex items-center gap-2 text-xs flex-wrap" style={{ color: t.textFaint }}>
+                      {a.legajo && <span>Legajo: {a.legajo}</span>}
+                      {isMulti && a.comisionId && <span className="px-1.5 py-0.5 rounded" style={{ background: t.ghost, color: t.ghostText }}>{a.comisionId}</span>}
+                    </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     {readOnly ? (
                       <div className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center"
                         style={{
-                          background: hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.ghost,
-                          color: hasNota ? (isAprobado ? t.greenText : t.redText) : t.textMut,
-                          border: `1px solid ${hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.surfaceBorder}`,
+                          background: isAusente ? t.yellowBg : hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.ghost,
+                          color: isAusente ? t.yellowText : hasNota ? (isAprobado ? t.greenText : t.redText) : t.textMut,
+                          border: `1px solid ${isAusente ? t.yellowBorder : hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.surfaceBorder}`,
                         }}>
-                        {a.nota || "—"}
+                        {isAusente ? "Aus." : (a.nota || "—")}
                       </div>
                     ) : (
-                      <select value={a.nota ?? ""} onChange={(e) => setNota(a.hash, e.target.value)}
-                        className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center outline-none cursor-pointer"
+                      <select value={isAusente ? "AUS" : (a.nota ?? "")} onChange={(e) => setNota(key, e.target.value)}
+                        className="w-20 px-2 py-1.5 rounded-lg text-sm font-bold text-center outline-none cursor-pointer"
                         style={{
-                          background: hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.inputBg,
-                          color: hasNota ? (isAprobado ? t.greenText : t.redText) : t.text,
-                          border: `1px solid ${hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.inputBorder}`,
+                          background: isAusente ? t.yellowBg : hasNota ? (isAprobado ? t.greenBg : t.redBg) : t.inputBg,
+                          color: isAusente ? t.yellowText : hasNota ? (isAprobado ? t.greenText : t.redText) : t.text,
+                          border: `1px solid ${isAusente ? t.yellowBorder : hasNota ? (isAprobado ? t.greenBorder : t.redBorder) : t.inputBorder}`,
                         }}>
                         <option value="" style={{ background: t.optBg }}>—</option>
+                        <option value="AUS" style={{ background: t.optBg }}>Aus.</option>
                         {[0,1,2,3,4,5,6,7,8,9,10].map((n) => (
                           <option key={n} value={n.toString()} style={{ background: t.optBg }}>{n}</option>
                         ))}
@@ -775,12 +834,19 @@ function Unified({ coms, onBack }) {
   const [saved, setSaved] = useState(false);
   const [hrs, setHrs] = useState(3);
   const [evals, setEvals] = useState([]);
+  const [crearHashes, setCrearHashes] = useState([]);
   const [loadingEvals, setLoadingEvals] = useState(false);
   const [error, setError] = useState("");
   const [saveResults, setSaveResults] = useState(null);
   const [comisionDetails, setComisionDetails] = useState([]);
   const [showCrearEval, setShowCrearEval] = useState(false);
   const [selectedEval, setSelectedEval] = useState(null);
+  // Temas state
+  const [selectedTemaClase, setSelectedTemaClase] = useState(null);
+  const [temaText, setTemaText] = useState("");
+  const [loadingTema, setLoadingTema] = useState(false);
+  const [savingTema, setSavingTema] = useState(false);
+  const [temaSaved, setTemaSaved] = useState(false);
 
   const tot = coms.reduce((a, c) => a + (c.inscriptos || 0), 0);
 
@@ -807,12 +873,87 @@ function Unified({ coms, onBack }) {
 
   const loadEvaluaciones = async () => {
     setLoadingEvals(true); setError("");
-    try { const hash = coms[0]?.hash; const data = await api.getEvaluaciones(hash); setEvals(data.evaluaciones || []); }
-    catch (e) { setError(e.message); }
+    try {
+      // Fetch evaluaciones from ALL selected comisiones in parallel
+      const results = await Promise.all(coms.map((c) =>
+        api.getEvaluaciones(c.hash).then((data) => ({ comisionHash: c.hash, comisionId: c.id, evaluaciones: data.evaluaciones || [], crearHash: data.crearHash }))
+                                  .catch(() => ({ comisionHash: c.hash, comisionId: c.id, evaluaciones: [], crearHash: null }))
+      ));
+
+      // Group by nombre+tipo+fecha (eval that was created across multiple comisiones)
+      const groupMap = new Map();
+      for (const r of results) {
+        for (const ev of r.evaluaciones) {
+          const key = `${ev.nombre}|${ev.tipo || ""}|${ev.fecha || ""}`;
+          if (!groupMap.has(key)) {
+            groupMap.set(key, {
+              nombre: ev.nombre,
+              tipo: ev.tipo,
+              fecha: ev.fecha,
+              hora_inicio: ev.hora_inicio,
+              hora_fin: ev.hora_fin,
+              estado: ev.estado,
+              items: [],
+            });
+          }
+          groupMap.get(key).items.push({
+            comisionHash: r.comisionHash,
+            comisionId: r.comisionId,
+            cargarHash: ev.cargarHash,
+            verCerrarHash: ev.verCerrarHash,
+            editarHash: ev.editarHash,
+            estado: ev.estado,
+          });
+        }
+      }
+      // Compute aggregate estado: closed only if ALL items are closed
+      const grouped = Array.from(groupMap.values()).map((g) => ({
+        ...g,
+        estado: g.items.every((i) => i.estado === "Cerrada") ? "Cerrada" : "Abierta",
+      }));
+      // Store crearHashes for create flow (one per comision)
+      setCrearHashes(results.map((r) => ({ comisionHash: r.comisionHash, crearHash: r.crearHash })).filter((r) => r.crearHash));
+      setEvals(grouped);
+    } catch (e) { setError(e.message); }
     finally { setLoadingEvals(false); }
   };
 
   useEffect(() => { if (tab === "parc") loadEvaluaciones(); }, [tab]);
+
+  // ── TEMAS ──
+  const loadTema = async (clase) => {
+    setSelectedTemaClase(clase); setLoadingTema(true); setError(""); setTemaSaved(false); setTemaText("");
+    try {
+      // Use first comision's temasHash + claseId to fetch current tema
+      if (!clases.temasBaseHash) throw new Error("No se encontró el hash de temas");
+      const data = await api.getTema(clases.temasBaseHash, clase.claseId);
+      setTemaText(data.tema || "");
+    } catch (e) { setError(e.message); }
+    finally { setLoadingTema(false); }
+  };
+
+  const guardarTema = async () => {
+    if (!selectedTemaClase) return;
+    setSavingTema(true); setError(""); setTemaSaved(false);
+    try {
+      if (coms.length === 1) {
+        // Single comision: save directly
+        await api.guardarTema(clases.temasBaseHash, selectedTemaClase.claseId, temaText);
+      } else {
+        // Multi-comision: save to all comisiones matching the fecha
+        const r = await api.guardarTemaBatch(coms.map((c) => ({ comisionHash: c.hash })), temaText, selectedTemaClase.fecha);
+        const failed = (r.results || []).filter((x) => !x.ok);
+        if (failed.length > 0) {
+          setError(`Falló en ${failed.length} comisión(es): ${failed.map((f) => f.error || "?").join(", ")}`);
+          setSavingTema(false);
+          return;
+        }
+      }
+      setTemaSaved(true);
+      setTimeout(() => setTemaSaved(false), 2500);
+    } catch (e) { setError(e.message); }
+    finally { setSavingTema(false); }
+  };
 
   const setE = (hash, v) => { setAlumnos((p) => p.map((a) => a.hash === hash ? { ...a, estado: v } : a)); setSaved(false); setSaveResults(null); };
   const allE = (v) => { setAlumnos((p) => p.map((a) => ({ ...a, estado: v }))); setSaved(false); setSaveResults(null); };
@@ -829,7 +970,7 @@ function Unified({ coms, onBack }) {
 
   const pres = alumnos.filter((a) => a.estado === 0).length;
   const aus = alumnos.filter((a) => a.estado > 0).length;
-  const tabs = [{ id: "asist", l: "Asistencia", i: ico.clip }, { id: "parc", l: "Parciales", i: ico.cal }, { id: "cls", l: "Clases", i: ico.list }];
+  const tabs = [{ id: "asist", l: "Asistencia", i: ico.clip }, { id: "parc", l: "Parciales", i: ico.cal }, { id: "tem", l: "Temas", i: ico.edit }, { id: "cls", l: "Clases", i: ico.list }];
 
   return (
     <div className="space-y-4">
@@ -849,7 +990,7 @@ function Unified({ coms, onBack }) {
 
       <div className="flex gap-1 p-1 rounded-xl" style={{ background: t.surface }}>
         {tabs.map((tb) => (
-          <button key={tb.id} onClick={() => { setTab(tb.id); setSelectedClase(null); setSelectedEval(null); }}
+          <button key={tb.id} onClick={() => { setTab(tb.id); setSelectedClase(null); setSelectedEval(null); setSelectedTemaClase(null); }}
             className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium transition-all"
             style={tab === tb.id ? { background: t.greenBg, color: t.greenText } : { color: t.textMut }}>{tb.i} {tb.l}</button>
         ))}
@@ -945,7 +1086,7 @@ function Unified({ coms, onBack }) {
       {tab === "parc" && (
         selectedEval ? (
           <CargarNotas
-            cargarHash={selectedEval.cargarHash}
+            items={selectedEval.items}
             evalNombre={selectedEval.nombre}
             readOnly={selectedEval.readOnly}
             onBack={() => { setSelectedEval(null); loadEvaluaciones(); }}
@@ -963,8 +1104,8 @@ function Unified({ coms, onBack }) {
             </div>
 
             {coms.length > 1 && (
-              <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.yellowBg, border: `1px solid ${t.yellowBorder}`, color: t.yellowText }}>
-                <span className="shrink-0 mt-px">{ico.warn}</span> Mostrando evaluaciones de {coms[0]?.id}. Al crear, se aplica a las {coms.length} comisiones.
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.blueBg, border: `1px solid ${t.blueBorder}`, color: t.blueText }}>
+                <span className="shrink-0 mt-px">{ico.warn}</span> Vista unificada: las evaluaciones se aplican a las {coms.length} comisiones. Al cargar notas se muestran todos los alumnos juntos.
               </div>
             )}
 
@@ -978,53 +1119,56 @@ function Unified({ coms, onBack }) {
               </div>
             )}
 
-            {evals.map((ev, i) => (
-              <div key={i} className="rounded-xl overflow-hidden" style={{ background: t.surface, border: `1px solid ${t.surfaceBorder}` }}>
-                <div className="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-semibold" style={{ color: t.text }}>{ev.nombre}</span>
-                      <span className="px-1.5 py-0.5 rounded text-xs" style={
-                        ev.estado === "Abierta"
-                          ? { background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
-                          : ev.estado === "Cerrada"
-                          ? { background: t.redBg, color: t.redText, boxShadow: `inset 0 0 0 1x ${t.redBorder}` }
-                          : { background: t.yellowBg, color: t.yellowText, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }
-                      }>{ev.estado}</span>
-                    </div>
-                    <div className="flex items-center gap-3 mt-1 text-xs" style={{ color: t.textMut }}>
-                      <span>{ev.tipo}</span>
-                      <span>📅 {ev.fecha}</span>
-                      {ev.visible && <span>{ev.visible === "SI" ? "👁 Visible" : "🔒 Oculta"}</span>}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    {ev.porcentaje > 0 && (
-                      <div className="flex items-center gap-1.5">
-                        <div className="w-16 h-1.5 rounded-full overflow-hidden" style={{ background: t.ghost }}>
-                          <div className="h-full rounded-full" style={{ width: `${Math.min(ev.porcentaje, 100)}%`, background: ev.porcentaje >= 100 ? "#22c55e" : "#eab308" }} />
-                        </div>
-                        <span className="text-xs" style={{ color: t.textMut }}>{ev.porcentaje}%</span>
+            {evals.map((ev, i) => {
+              const hasCargar = ev.items.some((it) => it.cargarHash);
+              const hasVerCerrar = ev.items.some((it) => it.verCerrarHash);
+              const partial = ev.items.length < coms.length;
+              return (
+                <div key={i} className="rounded-xl overflow-hidden" style={{ background: t.surface, border: `1px solid ${t.surfaceBorder}` }}>
+                  <div className="px-4 py-3 flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="text-sm font-semibold" style={{ color: t.text }}>{ev.nombre}</span>
+                        <span className="px-1.5 py-0.5 rounded text-xs" style={
+                          ev.estado === "Abierta"
+                            ? { background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }
+                            : ev.estado === "Cerrada"
+                            ? { background: t.redBg, color: t.redText, boxShadow: `inset 0 0 0 1px ${t.redBorder}` }
+                            : { background: t.yellowBg, color: t.yellowText, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }
+                        }>{ev.estado}</span>
+                        {coms.length > 1 && (
+                          <span className="px-1.5 py-0.5 rounded text-xs" style={
+                            partial
+                              ? { background: t.yellowBg, color: t.yellowText, boxShadow: `inset 0 0 0 1px ${t.yellowBorder}` }
+                              : { background: t.ghost, color: t.ghostText }
+                          }>{ev.items.length}/{coms.length} comisiones</span>
+                        )}
                       </div>
-                    )}
-                    {ev.cargarHash && (
-                      <button onClick={() => setSelectedEval({ cargarHash: ev.cargarHash, nombre: ev.nombre })}
-                        className="px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center gap-1"
-                        style={{ background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }}>
-                        ✏️ Cargar
-                      </button>
-                    )}
-                    {ev.verCerrarHash && (
-                      <button onClick={() => setSelectedEval({ cargarHash: ev.cargarHash || ev.verCerrarHash, nombre: ev.nombre, readOnly: !ev.cargarHash })}
-                        className="px-2.5 py-1.5 rounded-md text-xs flex items-center gap-1"
-                        style={{ background: t.ghost, color: t.ghostText }}>
-                        📋 Ver/cerrar
-                      </button>
-                    )}
+                      <div className="flex items-center gap-3 mt-1 text-xs" style={{ color: t.textMut }}>
+                        <span>{ev.tipo}</span>
+                        <span>📅 {ev.fecha}</span>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {hasCargar && (
+                        <button onClick={() => setSelectedEval({ items: ev.items, nombre: ev.nombre, readOnly: false })}
+                          className="px-2.5 py-1.5 rounded-md text-xs font-medium flex items-center gap-1"
+                          style={{ background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` }}>
+                          ✏️ Cargar
+                        </button>
+                      )}
+                      {hasVerCerrar && (
+                        <button onClick={() => setSelectedEval({ items: ev.items, nombre: ev.nombre, readOnly: !hasCargar })}
+                          className="px-2.5 py-1.5 rounded-md text-xs flex items-center gap-1"
+                          style={{ background: t.ghost, color: t.ghostText }}>
+                          📋 Ver/cerrar
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
 
             {showCrearEval && (
               <CrearEvalModal
@@ -1035,6 +1179,73 @@ function Unified({ coms, onBack }) {
             )}
           </div>
         )
+      )}
+
+      {/* ── TEMAS ── */}
+      {tab === "tem" && !selectedTemaClase && (
+        loadingClases ? <LoadingScreen message="Cargando clases..." /> : (
+          <div className="space-y-3">
+            {coms.length > 1 && (
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.blueBg, border: `1px solid ${t.blueBorder}`, color: t.blueText }}>
+                <span className="shrink-0 mt-px">{ico.warn}</span> Vista unificada: el tema se guardará en las {coms.length} comisiones que tengan clase en esa fecha.
+              </div>
+            )}
+            {clases.dictadas.length > 0 && <h3 className="text-sm font-semibold" style={{ color: t.textSec }}>Clases dictadas</h3>}
+            {clases.dictadas.map((cl, i) => (
+              <button key={`d${i}`} onClick={() => loadTema(cl)} className="w-full text-left px-4 py-3 rounded-xl flex items-center justify-between transition-all"
+                style={{ background: t.surface, border: `1px solid ${t.surfaceBorder}` }}>
+                <div>
+                  <div className="text-sm font-medium" style={{ color: t.text }}>{cl.fecha} · {cl.dia}</div>
+                  <div className="text-xs" style={{ color: t.textMut }}>{cl.horario} · {cl.tipo}</div>
+                </div>
+                <span className="text-xs" style={{ color: t.greenText }}>✏️ Editar tema</span>
+              </button>
+            ))}
+            {clases.sinDictar.length > 0 && <h3 className="text-sm font-semibold pt-3" style={{ color: t.textSec }}>Sin dictar</h3>}
+            {clases.sinDictar.map((cl, i) => (
+              <button key={`s${i}`} onClick={() => loadTema(cl)} className="w-full text-left px-4 py-3 rounded-xl flex items-center justify-between transition-all"
+                style={{ background: t.surface, border: `1px solid ${t.surfaceBorder}`, opacity: 0.85 }}>
+                <div>
+                  <div className="text-sm font-medium" style={{ color: t.text }}>{cl.fecha} · {cl.dia}</div>
+                  <div className="text-xs" style={{ color: t.textMut }}>{cl.horario} · {cl.tipo}</div>
+                </div>
+                <span className="text-xs" style={{ color: t.textMut }}>✏️ Cargar tema</span>
+              </button>
+            ))}
+            {clases.dictadas.length === 0 && clases.sinDictar.length === 0 && (
+              <div className="text-center py-8"><p className="text-sm" style={{ color: t.textMut }}>No se encontraron clases.</p></div>
+            )}
+          </div>
+        )
+      )}
+
+      {tab === "tem" && selectedTemaClase && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <button onClick={() => { setSelectedTemaClase(null); setTemaText(""); setTemaSaved(false); }} className="text-xs flex items-center gap-1" style={{ color: t.greenText }}>{ico.back} Volver a clases</button>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-sm font-semibold truncate" style={{ color: t.text }}>📝 Tema dictado · {selectedTemaClase.fecha}</h3>
+              <p className="text-xs" style={{ color: t.textMut }}>{selectedTemaClase.dia} · {selectedTemaClase.horario}</p>
+            </div>
+          </div>
+          {loadingTema ? <LoadingScreen message="Cargando tema..." /> : (
+            <>
+              <textarea value={temaText} onChange={(e) => { setTemaText(e.target.value); setTemaSaved(false); }}
+                rows={10} placeholder="Escribí el tema que dictaste esta clase..."
+                className="w-full px-3 py-2.5 rounded-lg text-sm outline-none focus:ring-2 focus:ring-green-500/40 resize-y"
+                style={{ background: t.inputBg, border: `1px solid ${t.inputBorder}`, color: t.text, minHeight: "200px" }} />
+              <div className="sticky bottom-4 pt-2">
+                <button onClick={guardarTema} disabled={savingTema}
+                  className="w-full py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white shadow-lg hover:brightness-110 active:scale-[0.99] transition-all"
+                  style={{ background: temaSaved ? "#16a34a" : "linear-gradient(135deg, #22c55e, #16a34a)" }}>
+                  {savingTema ? <><Spinner size={16} /> Guardando...</>
+                    : temaSaved ? <>{ico.chk} ¡Tema guardado{coms.length > 1 ? ` en ${coms.length} comisiones` : ""}!</>
+                    : <>Guardar tema{coms.length > 1 ? ` (${coms.length} comisiones)` : ""}</>}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       )}
 
       {/* ── CLASES TABLE ── */}
