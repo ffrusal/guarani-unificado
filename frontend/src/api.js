@@ -63,6 +63,25 @@ export async function loginWithCookie(session) {
 export async function getComisionesClases() { return apiFetch("/api/comisiones/clases"); }
 export async function getComisionesParciales() { return apiFetch("/api/comisiones/parciales"); }
 export async function getClases(hash) { return apiFetch(`/api/clases/${hash}`); }
+
+// ── TEMAS ──
+export async function getTema(temasHash, claseId) {
+  return apiFetch(`/api/temas/${temasHash}/${claseId}`);
+}
+
+export async function guardarTema(temasHash, claseId, tema) {
+  return apiFetch(`/api/temas/${temasHash}/${claseId}`, {
+    method: "POST",
+    body: JSON.stringify({ tema }),
+  });
+}
+
+export async function guardarTemaBatch(comisiones, tema, fecha) {
+  return apiFetch(`/api/temas-batch`, {
+    method: "POST",
+    body: JSON.stringify({ comisiones, tema, fecha }),
+  });
+}
 export async function getAsistencia(hash, claseId) { return apiFetch(`/api/asistencia/${hash}/${claseId}`); }
 
 export async function getAsistenciaUnificada(comisionHashes, fecha) {

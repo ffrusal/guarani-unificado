@@ -172,7 +172,10 @@ function parseClases(rawText) {
   parseSec(s?.[1], sinDictar, false);
   let asistenciaBaseHash = null;
   if (dictadas.length > 0 && dictadas[0].asistenciaHash) asistenciaBaseHash = dictadas[0].asistenciaHash;
-  return { dictadas, sinDictar, asistenciaBaseHash };
+  // Extract temas hash from navigation pills (same per comision)
+  const temasMatch = rawText.match(/temas_dictados\/([a-f0-9]+)/);
+  const temasBaseHash = temasMatch ? temasMatch[1] : null;
+  return { dictadas, sinDictar, asistenciaBaseHash, temasBaseHash };
 }
 
 // ── Parse alumnos ──
@@ -288,56 +291,79 @@ function extractOnArrivalByClass(rawText, targetClass) {
 
 // ── Parse editar_notas page ──
 function parseNotasPage(rawText) {
-  const obj = extractOnArrivalByClass(rawText, "edicion_notas");
+  // Try edicion_notas first (edit mode, eval abierta)
+  let obj = extractOnArrivalByClass(rawText, "edicion_notas");
+  let readOnly = false;
+  if (!obj) {
+    // Fall back to lista_notas (read-only mode, eval cerrada)
+    obj = extractOnArrivalByClass(rawText, "lista_notas");
+    readOnly = true;
+  }
   if (!obj) return null;
+
   const info = obj.info || {};
   const content = obj.content || "";
-
-  // Parse student rows from content
   const alumnos = [];
-  // Students in SIU edicion_notas have inputs: alumnos[HASH][nota], [resultado], [corregido_por]
-  // And display: nombre, legajo in spans/divs
-  const rowRegex = /class=['"]\s*renglon\s*['"][^>]*>([\s\S]*?)<\/tr>/g;
-  const rows = extractAll(content, rowRegex);
-  for (const row of rows) {
-    const rc = row[1];
-    const hashMatch = rc.match(/alumnos\[([a-f0-9]+)\]/);
-    if (!hashMatch) continue;
-    const hash = hashMatch[1];
-    const nameMatch = rc.match(/class=['"]alumno['"][^>]*>([^<]+)/);
-    const legMatch = rc.match(/class=['"]legajo['"][^>]*>([^<]+)/);
-    const notaMatch = rc.match(/\[nota\]['"][^>]*value=['"]([^'"]*)['"]/);
-    const resMatch = rc.match(/\[resultado\][\s\S]*?selected[^>]*value=['"]([^'"]+)['"]/);
-    alumnos.push({
-      hash,
-      nombre: nameMatch ? nameMatch[1].trim() : "",
-      legajo: legMatch ? legMatch[1].trim() : "",
-      nota: notaMatch ? notaMatch[1] : "",
-      resultado: resMatch ? resMatch[1] : "",
-    });
-  }
 
-  // Fallback: use info.alumnos if content parsing found nothing
-  if (alumnos.length === 0 && Array.isArray(info.alumnos)) {
-    for (const a of info.alumnos) {
+  if (readOnly) {
+    // Parse lista_notas: students in HTML rows with data-alumno="ID"
+    const rowRegex = /<tr[^>]*data-alumno=['"](\d+)['"][^>]*>([\s\S]*?)<\/tr>/g;
+    const rows = extractAll(content, rowRegex);
+    for (const row of rows) {
+      const id = row[1];
+      const rc = row[2];
+      const nameMatch = rc.match(/class=['"]nombre['"]>([^<]+)</);
+      const legMatch = rc.match(/class=['"]legajo['"]>\s*Legajo:\s*([^<]*)</);
+      const notaMatch = rc.match(/class=['"]centrar alinear['"]>\s*(\d+)\s*\(/);
+      const resMatch = rc.match(/class=['"]js-resultado-text['"]>([^<]+)</);
       alumnos.push({
-        hash: a.hash || a.id || "",
-        nombre: a.apellido_nombre || a.nombre || "",
-        legajo: a.legajo || "",
-        nota: a.nota ?? "",
-        resultado: a.resultado || "",
+        hash: id,
+        nombre: nameMatch ? nameMatch[1].trim() : "",
+        legajo: legMatch ? legMatch[1].trim() : "",
+        nota: notaMatch ? notaMatch[1] : "",
+        resultado: resMatch ? resMatch[1].trim() : "",
       });
+    }
+  } else {
+    // Parse edicion_notas: use info.alumnos JSON (much more reliable)
+    // Map SIU resultado codes (A/R/U) to readable text
+    const resMap = { A: "Aprobado", R: "Reprobado", U: "Ausente", "": "" };
+    if (info.alumnos && typeof info.alumnos === "object") {
+      for (const id in info.alumnos) {
+        const a = info.alumnos[id];
+        alumnos.push({
+          hash: a.alumno || id, // student ID (numeric)
+          nombre: a.apellido_nombres_elegido || a.alumno_nombre || "",
+          legajo: a.legajo || "",
+          nota: a.nota || "",
+          resultado: resMap[a.resultado] !== undefined ? resMap[a.resultado] : (a.resultado_nombre || ""),
+          resultadoCode: a.resultado || "", // raw code for saving
+        });
+      }
     }
   }
 
+  const reabrirMatch = content.match(/reabrir_evaluacion\/([a-f0-9]+)/);
+  const cerrarMatch = content.match(/cerrar_evaluacion\/([a-f0-9]+)/);
+  const fechaMatch = content.match(/<strong>Fecha:<\/strong><\/td><td>([^<]+)/);
+  const estadoMatch = content.match(/<strong>Estado:<\/strong><\/td><td>([^<]+)/);
+
+  // Sort alphabetically by name (case-insensitive, accent-aware)
+  alumnos.sort((a, b) => (a.nombre || "").localeCompare((b.nombre || ""), "es", { sensitivity: "base" }));
+
   return {
     alumnos,
+    readOnly,
     evaluacionHash: info.evaluacion || null,
     escalaId: info.id_escala || "102",
     resultadoNotas: info.resultado_notas || [],
     urlGuardar: info.url_guardar || null,
     urlAgregarComision: info.url_agregar_comision || null,
-    hayAlumnos: content.includes("mensaje_vacio") && content.includes("No hay alumnos") ? false : alumnos.length > 0,
+    hayAlumnos: alumnos.length > 0,
+    reabrirHash: reabrirMatch ? reabrirMatch[1] : null,
+    cerrarHash: cerrarMatch ? cerrarMatch[1] : null,
+    fecha: fechaMatch ? fechaMatch[1].trim() : "",
+    estado: estadoMatch ? estadoMatch[1].trim() : "",
   };
 }
 
@@ -384,6 +410,35 @@ async function handleRequest(request, env) {
 
       console.log("Login profile check - isDocente:", isDocente, "url:", vRes.url);
 
+      return Response.json({ ok: true, session, nombre }, { headers: cors });
+    }
+
+    // ── LOGIN WITH COOKIE (for OAuth-based USAL login) ──
+    // User authenticates at autogestion.usal.edu.ar via Google OAuth,
+    // then passes the resulting session cookie here
+    if (path === "/api/login-with-cookie" && request.method === "POST") {
+      let { session } = await request.json();
+      if (!session) return Response.json({ error: "Sesión vacía" }, { status: 400, headers: cors });
+
+      session = session.trim();
+      // If user pasted just the value (no =), prepend the cookie name
+      if (!session.includes("=")) session = "siu_sess__autogestion_des01=" + session;
+      // If user pasted with quotes, strip them
+      session = session.replace(/^["']|["']$/g, "");
+
+      // Verify and switch to Docente profile
+      await gFetch("acceso/perfil?id=Docente", session);
+
+      const vRes = await gFetch("inicio_docente", session);
+      const vHtml = await gText(vRes);
+
+      // Check if session is valid (not redirected to login)
+      if (vHtml.includes("auth=cuenta_ext") || vHtml.includes("Ingresar con cuenta") || vHtml.includes("acceso/login")) {
+        return Response.json({ error: "Sesión inválida o expirada. Iniciá sesión en autogestion.usal.edu.ar y copiá la cookie de nuevo." }, { status: 401, headers: cors });
+      }
+
+      const nm = vHtml.match(/Bienvenido\s+([^<]+)/);
+      const nombre = nm ? nm[1].trim() : (vHtml.match(/icon-user[^>]*>[^<]*<\/i>\s*([^<]+)/)?.[1]?.trim() || "Docente");
       return Response.json({ ok: true, session, nombre }, { headers: cors });
     }
 
@@ -713,17 +768,19 @@ async function handleRequest(request, env) {
       return Response.json({ results }, { headers: cors });
     }
 
-    // ── NOTAS: GET editar_notas page ──
+    // ── NOTAS: GET (editar_notas or listar_notas) ──
     if (path.match(/^\/api\/notas\/[a-f0-9]+$/) && request.method === "GET") {
       const session = request.headers.get("Authorization");
       if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
-      const cargarHash = path.replace("/api/notas/", "");
-      const res = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+      const hash = path.replace("/api/notas/", "");
+      const readOnly = url.searchParams.get("readonly") === "1";
+      const siuPath = readOnly ? `evaluaciones/listar_notas/${hash}` : `evaluaciones/editar_notas/${hash}`;
+      const res = await gFetch(siuPath, session);
       const raw = await gText(res);
       if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
       const parsed = parseNotasPage(raw);
       if (!parsed) return Response.json({ error: "No se pudo parsear la página de notas" }, { status: 500, headers: cors });
-      console.log("Notas page: alumnos:", parsed.alumnos.length, "hayAlumnos:", parsed.hayAlumnos);
+      console.log("Notas page:", siuPath.split('/').pop().slice(0,8), "alumnos:", parsed.alumnos.length, "readOnly:", parsed.readOnly);
       return Response.json(parsed, { headers: cors });
     }
 
@@ -786,15 +843,18 @@ async function handleRequest(request, env) {
       }
       if (!evalHash) return Response.json({ error: "No evaluacion hash" }, { status: 400, headers: cors });
 
-      // Build form data: evaluacion=HASH&alumnos[HASH][nota]=X&alumnos[HASH][resultado]=Y
+      // Build form data: evaluacion=HASH&alumnos[ID][nota]=X&alumnos[ID][resultado]=Y
+      // SIU expects: resultado as code (A/R/U), nota as 0-10, hash as numeric student ID
+      const resCodeMap = { "Aprobado": "A", "Reprobado": "R", "Ausente": "U", "A": "A", "R": "R", "U": "U" };
       const params = new URLSearchParams();
       params.set("evaluacion", evalHash);
       for (const al of alumnos) {
-        if (al.nota !== "" && al.nota !== undefined) {
+        if (al.nota !== "" && al.nota !== undefined && al.nota !== null) {
           params.set(`alumnos[${al.hash}][nota]`, al.nota.toString());
         }
         if (al.resultado) {
-          params.set(`alumnos[${al.hash}][resultado]`, al.resultado);
+          const code = resCodeMap[al.resultado] || al.resultado;
+          params.set(`alumnos[${al.hash}][resultado]`, code);
         }
         if (al.corregido_por) {
           params.set(`alumnos[${al.hash}][corregido_por]`, al.corregido_por);
@@ -820,6 +880,121 @@ async function handleRequest(request, env) {
       } catch (e) {
         return Response.json({ ok: saveRes.status === 200, raw: saveRaw.substring(0, 200) }, { headers: cors });
       }
+    }
+
+    // ── NOTAS: reabrir evaluación ──
+    if (path.match(/^\/api\/notas\/[a-f0-9]+\/reabrir$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const reabrirHash = path.replace("/api/notas/", "").replace("/reabrir", "");
+      const res = await gFetch(`evaluaciones/reabrir_evaluacion/${reabrirHash}`, session);
+      const raw = await gText(res);
+      if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      return Response.json({ ok: true }, { headers: cors });
+    }
+
+    // ── NOTAS: cerrar evaluación ──
+    if (path.match(/^\/api\/notas\/[a-f0-9]+\/cerrar$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const cerrarHash = path.replace("/api/notas/", "").replace("/cerrar", "");
+      const res = await gFetch(`evaluaciones/cerrar_evaluacion/${cerrarHash}`, session);
+      const raw = await gText(res);
+      if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      return Response.json({ ok: true }, { headers: cors });
+    }
+
+    // ── TEMAS: GET tema for a specific clase ──
+    if (path.match(/^\/api\/temas\/[a-f0-9]+\/\d+$/) && request.method === "GET") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const parts = path.replace("/api/temas/", "").split("/");
+      const temasHash = parts[0];
+      const claseId = parts[1];
+      const res = await gFetch(`temas_dictados/${temasHash}/${claseId}`, session);
+      const raw = await gText(res);
+      if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      // Extract textarea content
+      const obj = extractOnArrivalByClass(raw, "edicion_temas");
+      let tema = "";
+      if (obj && obj.content) {
+        const m = obj.content.match(/<textarea[^>]*name=['"]tema_dictado['"][^>]*>([\s\S]*?)<\/textarea>/);
+        if (m) tema = m[1].replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#039;/g, "'");
+      }
+      return Response.json({ tema, claseId, temasHash }, { headers: cors });
+    }
+
+    // ── TEMAS: POST save tema for a specific clase ──
+    if (path.match(/^\/api\/temas\/[a-f0-9]+\/\d+$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const parts = path.replace("/api/temas/", "").split("/");
+      const temasHash = parts[0];
+      const claseId = parts[1];
+      const { tema } = await request.json();
+      const params = new URLSearchParams();
+      params.set("clase", claseId);
+      params.set("tema_dictado", tema || "");
+      const res = await gFetch(`temas_dictados/${temasHash}/${claseId}`, session, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "Origin": "https://autogestion.usal.edu.ar",
+          "Referer": `${BASE}/temas_dictados/${temasHash}/${claseId}`,
+        },
+        body: params.toString(),
+      });
+      const raw = await gText(res);
+      const ok = res.status === 200 && !raw.includes("acceso/login");
+      return Response.json({ ok, claseId }, { headers: cors });
+    }
+
+    // ── TEMAS: batch save same tema to multiple comisiones (matched by fecha) ──
+    if (path === "/api/temas-batch" && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const { comisiones, tema, fecha } = await request.json();
+      // comisiones: [{ comisionHash }] — resolve temasHash + matching claseId by fecha for each
+      const results = [];
+      for (const com of comisiones) {
+        try {
+          const cr = await gFetch(`zona_clases/home/${com.comisionHash}`, session);
+          const ch = await gText(cr);
+          const parsed = parseClases(ch);
+          const temasHash = parsed.temasBaseHash;
+          if (!temasHash) { results.push({ comisionHash: com.comisionHash, ok: false, error: "No temas hash" }); continue; }
+          // Match clase by fecha (search in both dictadas and sinDictar — but only dictadas have claseId)
+          // For sinDictar we still need to find the claseId — fall back to searching raw HTML
+          const allClases = [...(parsed.dictadas || []), ...(parsed.sinDictar || [])];
+          let claseId = null;
+          const target = allClases.find((c) => c.fecha === fecha);
+          if (target && target.claseId) claseId = target.claseId;
+          if (!claseId) {
+            // Try to find any claseId for that fecha in the raw HTML via temas_dictados links
+            const rx = new RegExp(`temas_dictados\\/${temasHash}\\/(\\d+)[^>]*>([^<]*${fecha.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")})`, "i");
+            const m = ch.match(rx);
+            if (m) claseId = m[1];
+          }
+          if (!claseId) { results.push({ comisionHash: com.comisionHash, ok: false, error: `Clase no encontrada para ${fecha}` }); continue; }
+          const params = new URLSearchParams();
+          params.set("clase", claseId);
+          params.set("tema_dictado", tema || "");
+          const r = await gFetch(`temas_dictados/${temasHash}/${claseId}`, session, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+              "Origin": "https://autogestion.usal.edu.ar",
+              "Referer": `${BASE}/temas_dictados/${temasHash}/${claseId}`,
+            },
+            body: params.toString(),
+          });
+          const ok = r.status === 200;
+          results.push({ comisionHash: com.comisionHash, ok, claseId });
+        } catch (e) {
+          results.push({ comisionHash: com.comisionHash, ok: false, error: e.message });
+        }
+      }
+      return Response.json({ results }, { headers: cors });
     }
 
     // ── GRUPOS ──
