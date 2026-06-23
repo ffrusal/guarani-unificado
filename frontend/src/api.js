@@ -82,6 +82,18 @@ export async function guardarTemaBatch(comisiones, tema, fecha) {
     body: JSON.stringify({ comisiones, tema, fecha }),
   });
 }
+
+// ── CIERRE DE CURSADA ──
+export async function getCierre(comisionHash) {
+  return apiFetch(`/api/cierre/${comisionHash}`);
+}
+
+export async function guardarCierre(edicionHash, alumnos) {
+  return apiFetch(`/api/cierre/${edicionHash}/guardar`, {
+    method: "POST",
+    body: JSON.stringify({ alumnos }),
+  });
+}
 export async function getAsistencia(hash, claseId) { return apiFetch(`/api/asistencia/${hash}/${claseId}`); }
 
 export async function getAsistenciaUnificada(comisionHashes, fecha) {

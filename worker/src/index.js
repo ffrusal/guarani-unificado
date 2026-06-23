@@ -152,7 +152,8 @@ function parseClases(rawText) {
       const tds = extractAll(c, tdRegex);
       if (tds.length < 4) continue;
       const cl = (s) => s.replace(/<[^>]*>/g, "").trim();
-      const am = c.match(/asistencias\/([a-f0-9]+)\/(\d+)/);
+      const am = c.match(/asistencias\\?\/([a-f0-9]+)\\?\/(\d+)/);
+      const tm = c.match(/temas_dictados\\?\/([a-f0-9]+)\\?\/(\d+)/);
       const clase = { fecha: cl(tds[0][1]), dia: cl(tds[1][1]), horario: cl(tds[2][1]), tipo: cl(tds[3][1]) };
       if (isDictada) {
         if (tds.length >= 5) {
@@ -161,9 +162,13 @@ function parseClases(rawText) {
           clase.ausentes = pa ? parseInt(pa[2]) : null;
         }
         clase.asistenciaHash = am ? am[1] : null;
-        clase.claseId = am ? am[2] : null;
+        clase.claseId = am ? am[2] : (tm ? tm[2] : null);
         arr.push(clase);
-      } else { arr.push(clase); }
+      } else {
+        // sinDictar: extract claseId from temas_dictados link
+        clase.claseId = tm ? tm[2] : (am ? am[2] : null);
+        arr.push(clase);
+      }
     }
   };
   const d = html.match(/Clases dictadas([\s\S]*?)(?:Clases sin dictar|$)/i);
@@ -172,8 +177,10 @@ function parseClases(rawText) {
   parseSec(s?.[1], sinDictar, false);
   let asistenciaBaseHash = null;
   if (dictadas.length > 0 && dictadas[0].asistenciaHash) asistenciaBaseHash = dictadas[0].asistenciaHash;
-  // Extract temas hash from navigation pills (same per comision)
-  const temasMatch = rawText.match(/temas_dictados\/([a-f0-9]+)/);
+  // Extract temas hash from navigation pills (same per comision).
+  // SIU wraps URLs in JSON on_arrival(...) so slashes may be escaped as \/.
+  // Match both `temas_dictados/HASH` and `temas_dictados\/HASH`.
+  const temasMatch = rawText.match(/temas_dictados\\?\/([a-f0-9]+)/);
   const temasBaseHash = temasMatch ? temasMatch[1] : null;
   return { dictadas, sinDictar, asistenciaBaseHash, temasBaseHash };
 }
@@ -200,6 +207,109 @@ function parseAlumnos(rawText) {
     if (legMatch) alumnos[i].legajo = legMatch[1];
   }
   return alumnos;
+}
+
+// ── Parse cierre de cursada (cursada/edicion page) ──
+// Each student has a regular row + a promocion row, both with renglones[ID][field] inputs/selects.
+function cursadaInputValue(chunk, id, field) {
+  const re = new RegExp(`name=['"]renglones\\[${id}\\]\\[${field}\\]['"][^>]*?value=['"]([^'"]*)['"]`);
+  const m = chunk.match(re);
+  return m ? m[1] : "";
+}
+function cursadaSelectValue(chunk, id, field) {
+  const startRe = new RegExp(`name=['"]renglones\\[${id}\\]\\[${field}\\]['"]`);
+  const sm = chunk.match(startRe);
+  if (!sm) return "";
+  const start = sm.index;
+  const end = chunk.indexOf("</select>", start);
+  if (end === -1) return "";
+  const inner = chunk.substring(start, end);
+  const optRe = /<option([^>]*)>/g;
+  let o;
+  while ((o = optRe.exec(inner)) !== null) {
+    if (/\bselected\b/.test(o[1])) {
+      const vm = o[1].match(/value=['"]([^'"]*)['"]/);
+      return vm ? vm[1] : "";
+    }
+  }
+  return "";
+}
+function cursadaCondiciones(chunk, id) {
+  const startRe = new RegExp(`name=['"]renglones\\[${id}\\]\\[cond_regularidad\\]['"]`);
+  const sm = chunk.match(startRe);
+  if (!sm) return [];
+  const start = sm.index;
+  const end = chunk.indexOf("</select>", start);
+  if (end === -1) return [];
+  const inner = chunk.substring(start, end);
+  const opts = [];
+  const optRe = /<option([^>]*)>([\s\S]*?)<\/option>/g;
+  let o;
+  while ((o = optRe.exec(inner)) !== null) {
+    const vm = o[1].match(/value=['"]([^'"]*)['"]/);
+    const val = vm ? vm[1] : "";
+    const rm = o[1].match(/data-resultado=['"]([^'"]*)['"]/);
+    const label = o[2].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+    if (val) opts.push({ value: val, label, resultado: rm ? rm[1] : "" });
+  }
+  return opts;
+}
+function parseCursadaEdicion(raw) {
+  const comMatch = raw.match(/id=["']comision["'][^>]*>(\d+)</);
+  const comisionId = comMatch ? comMatch[1] : null;
+  const guardarMatch = raw.match(/cursada\/guardar\/([a-f0-9]+)\/(\d+)/);
+  const guardarHash = guardarMatch ? guardarMatch[1] : null;
+  const instancia = guardarMatch ? guardarMatch[2] : "1";
+
+  const alumnos = [];
+  const rowRe = /<tr id=['"]renglon_(\d+)['"][^>]*data-renglon=["']\d+["'][^>]*>([\s\S]*?)<\/tr>\s*<tr class=['"]js-renglon-promocion[\s\S]*?<\/tr>/g;
+  let m;
+  while ((m = rowRe.exec(raw)) !== null) {
+    const id = m[1];
+    const pair = m[0];
+    const nombreM = pair.match(/class=["']nombre["']>([^<]+)</);
+    const dniM = pair.match(/class=["']identificacion["']>([^<]+)</);
+    const asistM = pair.match(/col-asistencia["'][^>]*>\s*([\d.]+)/);
+    const actaM = pair.match(/col-nro-acta["'][^>]*>([\s\S]*?)<\/td>/);
+    alumnos.push({
+      renglonId: id,
+      nombre: nombreM ? nombreM[1].trim() : "",
+      dni: dniM ? dniM[1].trim() : "",
+      asistencia: asistM ? asistM[1] : "",
+      acta: actaM ? actaM[1].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim() : "",
+      fechaRegular: cursadaInputValue(pair, id, "fecha_regular"),
+      notaCursada: cursadaSelectValue(pair, id, "nota_cursada"),
+      resultadoCursada: cursadaSelectValue(pair, id, "resultado_cursada"),
+      condRegularidad: cursadaSelectValue(pair, id, "cond_regularidad"),
+      fechaPromocion: cursadaInputValue(pair, id, "fecha_promocion"),
+      notaPromocion: cursadaSelectValue(pair, id, "nota_promocion"),
+      resultadoPromocion: cursadaSelectValue(pair, id, "resultado_promocion"),
+    });
+  }
+  // Sort alphabetically
+  alumnos.sort((a, b) => (a.nombre || "").localeCompare((b.nombre || ""), "es", { sensitivity: "base" }));
+  const condiciones = alumnos.length ? cursadaCondiciones(raw, parseCursadaFirstRenglonId(raw)) : [];
+  return { comisionId, guardarHash, instancia, alumnos, condiciones };
+}
+function parseCursadaFirstRenglonId(raw) {
+  const m = raw.match(/<tr id=['"]renglon_(\d+)['"]/);
+  return m ? m[1] : "";
+}
+// Resolve the cierre/cursada edicion hash by navigating from a comision page.
+async function resolveCierreEdicion(comisionHash, session) {
+  // 1) ver_comision page (works with the stored comision hash) → cierre_cursadas link
+  const verRes = await gFetch(`evaluaciones/ver_comision/${comisionHash}`, session);
+  const verRaw = await gText(verRes);
+  if (verRaw.includes("acceso/login")) return { error: "Sesión expirada", status: 401 };
+  const cierreMatch = verRaw.match(/cierre_cursadas\/([a-f0-9]+)/);
+  if (!cierreMatch) return { error: "No se encontró el acta de cierre para esta comisión" };
+  const cierreHash = cierreMatch[1];
+  // 2) cierre_cursadas page → cursada/edicion link ("Carga de notas")
+  const cierreRes = await gFetch(`cierre_cursadas/${cierreHash}`, session);
+  const cierreRaw = await gText(cierreRes);
+  const edMatch = cierreRaw.match(/cursada\/edicion\/([a-f0-9]+)/);
+  if (!edMatch) return { error: "No hay actas abiertas para cargar (puede que ya esté cerrada)" };
+  return { cierreHash, edicionHash: edMatch[1] };
 }
 
 // ── Parse evaluaciones (improved v5) ──
@@ -338,6 +448,7 @@ function parseNotasPage(rawText) {
           nota: a.nota || "",
           resultado: resMap[a.resultado] !== undefined ? resMap[a.resultado] : (a.resultado_nombre || ""),
           resultadoCode: a.resultado || "", // raw code for saving
+          ultimoCambio: a.ultimo_cambio || "", // for concurrency control on save
         });
       }
     }
@@ -830,35 +941,56 @@ async function handleRequest(request, env) {
       const session = request.headers.get("Authorization");
       if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
       const cargarHash = path.replace("/api/notas/", "").replace("/guardar", "");
-      const { evaluacionHash, alumnos } = await request.json();
-      // alumnos: array of { hash, nota, resultado }
+      const { alumnos } = await request.json();
+      // alumnos from frontend: array of { hash, nota, resultado } (only the changes matter)
 
-      // First fetch the page to get the correct evaluacion hash if not provided
-      let evalHash = evaluacionHash;
-      if (!evalHash) {
-        const pageRes = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
-        const pageRaw = await gText(pageRes);
-        const pageData = parseNotasPage(pageRaw);
-        evalHash = pageData?.evaluacionHash;
+      // Re-fetch the editar_notas page to get the full student list + current ultimo_cambio
+      // for each (SIU uses ultimo_cambio for concurrency control and rejects/ignores
+      // saves that don't echo it back). We merge the frontend's notas onto this fresh list.
+      const pageRes = await gFetch(`evaluaciones/editar_notas/${cargarHash}`, session);
+      const pageRaw = await gText(pageRes);
+      const pageData = parseNotasPage(pageRaw);
+      if (!pageData || !pageData.evaluacionHash) {
+        return Response.json({ error: "No se pudo leer la evaluación" }, { status: 400, headers: cors });
       }
-      if (!evalHash) return Response.json({ error: "No evaluacion hash" }, { status: 400, headers: cors });
+      const evalHash = pageData.evaluacionHash;
 
-      // Build form data: evaluacion=HASH&alumnos[ID][nota]=X&alumnos[ID][resultado]=Y
-      // SIU expects: resultado as code (A/R/U), nota as 0-10, hash as numeric student ID
+      // Build a lookup of the frontend's intended notas/resultados by student ID
       const resCodeMap = { "Aprobado": "A", "Reprobado": "R", "Ausente": "U", "A": "A", "R": "R", "U": "U" };
+      const incoming = {};
+      for (const al of alumnos) {
+        incoming[al.hash] = {
+          nota: (al.nota !== "" && al.nota !== undefined && al.nota !== null) ? al.nota.toString() : "",
+          resultado: al.resultado ? (resCodeMap[al.resultado] || al.resultado) : "",
+        };
+      }
+
+      // SIU expects: evaluacion=HASH and a sequential array of ALL students:
+      //   alumnos[i][alumno]=ID, alumnos[i][nota]=N, alumnos[i][resultado]=CODE,
+      //   alumnos[i][ultimo_cambio]=TIMESTAMP
       const params = new URLSearchParams();
       params.set("evaluacion", evalHash);
-      for (const al of alumnos) {
-        if (al.nota !== "" && al.nota !== undefined && al.nota !== null) {
-          params.set(`alumnos[${al.hash}][nota]`, al.nota.toString());
+      let i = 0;
+      let changed = 0;
+      for (const student of pageData.alumnos) {
+        const id = student.hash;
+        const ov = incoming[id];
+        // Use incoming nota/resultado if the student was sent by the frontend,
+        // otherwise echo back the student's existing values (keep as-is).
+        let nota, resultado;
+        if (ov !== undefined) {
+          nota = ov.nota;
+          resultado = ov.resultado;
+          changed++;
+        } else {
+          nota = (student.nota !== undefined && student.nota !== null) ? student.nota.toString() : "";
+          resultado = student.resultadoCode || "";
         }
-        if (al.resultado) {
-          const code = resCodeMap[al.resultado] || al.resultado;
-          params.set(`alumnos[${al.hash}][resultado]`, code);
-        }
-        if (al.corregido_por) {
-          params.set(`alumnos[${al.hash}][corregido_por]`, al.corregido_por);
-        }
+        params.set(`alumnos[${i}][alumno]`, id);
+        params.set(`alumnos[${i}][nota]`, nota);
+        params.set(`alumnos[${i}][resultado]`, resultado);
+        params.set(`alumnos[${i}][ultimo_cambio]`, student.ultimoCambio || "");
+        i++;
       }
 
       const saveRes = await gFetch("evaluaciones/editar_alumnos", session, {
@@ -867,6 +999,7 @@ async function handleRequest(request, env) {
           "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           "X-Requested-With": "XMLHttpRequest",
           "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Origin": "https://autogestion.usal.edu.ar",
           "Referer": `${BASE}/evaluaciones/editar_notas/${cargarHash}`,
         },
         body: params.toString(),
@@ -874,12 +1007,17 @@ async function handleRequest(request, env) {
       const saveRaw = await gText(saveRes);
       console.log("Save notas response:", saveRaw.substring(0, 300));
 
+      let ok = saveRes.status === 200;
+      let result = null;
       try {
-        const result = JSON.parse(saveRaw);
-        return Response.json({ ok: true, result }, { headers: cors });
+        result = JSON.parse(saveRaw);
+        // SIU returns JSON; treat presence of an "error"/"errores" field as failure
+        if (result && (result.error || (result.errores && result.errores.length))) ok = false;
       } catch (e) {
-        return Response.json({ ok: saveRes.status === 200, raw: saveRaw.substring(0, 200) }, { headers: cors });
+        // Non-JSON response; fall back to status + absence of obvious error text
+        if (/error|excepc|login/i.test(saveRaw)) ok = false;
       }
+      return Response.json({ ok, saved: changed, result, raw: ok ? undefined : saveRaw.substring(0, 300) }, { headers: cors });
     }
 
     // ── NOTAS: reabrir evaluación ──
@@ -995,6 +1133,83 @@ async function handleRequest(request, env) {
         }
       }
       return Response.json({ results }, { headers: cors });
+    }
+
+    // ── CIERRE DE CURSADA: GET (load students + attendance + current values) ──
+    if (path.match(/^\/api\/cierre\/[a-f0-9]+$/) && request.method === "GET") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const comisionHash = path.replace("/api/cierre/", "");
+      const resolved = await resolveCierreEdicion(comisionHash, session);
+      if (resolved.error) return Response.json({ error: resolved.error }, { status: resolved.status || 400, headers: cors });
+      const edRes = await gFetch(`cursada/edicion/${resolved.edicionHash}`, session);
+      const edRaw = await gText(edRes);
+      if (edRaw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      const data = parseCursadaEdicion(edRaw);
+      return Response.json({ ...data, edicionHash: resolved.edicionHash }, { headers: cors });
+    }
+
+    // ── CIERRE DE CURSADA: POST guardar (merge incoming changes, send full form) ──
+    if (path.match(/^\/api\/cierre\/[a-f0-9]+\/guardar$/) && request.method === "POST") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const edicionHash = path.replace("/api/cierre/", "").replace("/guardar", "");
+      const { alumnos } = await request.json();
+      // alumnos: [{ renglonId, notaCursada, resultadoCursada, condRegularidad, fechaRegular?, notaPromocion?, resultadoPromocion?, fechaPromocion? }]
+
+      // Re-fetch edicion to get the full current state (all students + all fields + instancia)
+      const edRes = await gFetch(`cursada/edicion/${edicionHash}`, session);
+      const edRaw = await gText(edRes);
+      if (edRaw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      const current = parseCursadaEdicion(edRaw);
+      if (!current.guardarHash) return Response.json({ error: "No se pudo leer el acta" }, { status: 400, headers: cors });
+
+      // Map incoming changes by renglonId
+      const incoming = {};
+      for (const a of alumnos) incoming[a.renglonId] = a;
+
+      // Build full form body: every student, every field. Override with incoming where provided.
+      const params = new URLSearchParams();
+      let changed = 0;
+      for (const s of current.alumnos) {
+        const ov = incoming[s.renglonId] || {};
+        if (incoming[s.renglonId]) changed++;
+        const pick = (k) => (ov[k] !== undefined && ov[k] !== null) ? ov[k] : s[k];
+        params.set(`renglones[${s.renglonId}][fecha_regular]`, pick("fechaRegular") || "");
+        params.set(`renglones[${s.renglonId}][nota_cursada]`, pick("notaCursada") || "");
+        params.set(`renglones[${s.renglonId}][resultado_cursada]`, pick("resultadoCursada") || "");
+        params.set(`renglones[${s.renglonId}][cond_regularidad]`, pick("condRegularidad") || "");
+        params.set(`renglones[${s.renglonId}][fecha_promocion]`, pick("fechaPromocion") || "");
+        params.set(`renglones[${s.renglonId}][nota_promocion]`, pick("notaPromocion") || "");
+        params.set(`renglones[${s.renglonId}][resultado_promocion]`, pick("resultadoPromocion") || "");
+      }
+
+      const saveRes = await gFetch(`cursada/guardar/${current.guardarHash}/${current.instancia}`, session, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
+          "Accept": "application/json, text/javascript, */*; q=0.01",
+          "Origin": "https://autogestion.usal.edu.ar",
+          "Referer": `${BASE}/cursada/edicion/${edicionHash}`,
+        },
+        body: params.toString(),
+      });
+      const saveRaw = await gText(saveRes);
+      console.log("Save cierre response:", saveRaw.substring(0, 300));
+      let ok = saveRes.status === 200;
+      let result = null;
+      try {
+        result = JSON.parse(saveRaw);
+        if (result && (result.error || (result.errores && result.errores.length))) ok = false;
+        // SIU success message: "guardado_exitoso" / "Las notas se guardaron con éxito"
+        if (result && result.cod && result.cod !== "0" && result.cod !== 0 && result.cod !== "1") {
+          // some SIU responses use cod -2 for redirect-with-message (success). Keep ok unless explicit error.
+        }
+      } catch (e) {
+        if (/error|excepc|acceso\/login/i.test(saveRaw)) ok = false;
+      }
+      return Response.json({ ok, saved: changed, result, raw: ok ? undefined : saveRaw.substring(0, 300) }, { headers: cors });
     }
 
     // ── GRUPOS ──

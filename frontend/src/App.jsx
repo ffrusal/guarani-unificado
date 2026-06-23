@@ -54,6 +54,7 @@ const ico = {
   login: <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1" /></svg>,
   logout: <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>,
   chk: <svg width="12" height="12" fill="none" viewBox="0 0 24 24" stroke="white" strokeWidth="3"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>,
+  award: <svg width="17" height="17" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>,
   back: <svg width="18" height="18" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" /></svg>,
   warn: <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>,
   link: <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>,
@@ -847,6 +848,14 @@ function Unified({ coms, onBack }) {
   const [loadingTema, setLoadingTema] = useState(false);
   const [savingTema, setSavingTema] = useState(false);
   const [temaSaved, setTemaSaved] = useState(false);
+  // Cierre de cursada state
+  const [cierreAlumnos, setCierreAlumnos] = useState([]); // merged across comisiones, each w/ comisionHash + edicionHash
+  const [cierreCondiciones, setCierreCondiciones] = useState([]);
+  const [cierreMeta, setCierreMeta] = useState({}); // comisionHash -> { edicionHash, comisionId }
+  const [loadingCierre, setLoadingCierre] = useState(false);
+  const [savingCierre, setSavingCierre] = useState(false);
+  const [cierreSaved, setCierreSaved] = useState(false);
+  const [cierreErrors, setCierreErrors] = useState([]);
 
   const tot = coms.reduce((a, c) => a + (c.inscriptos || 0), 0);
 
@@ -920,6 +929,81 @@ function Unified({ coms, onBack }) {
 
   useEffect(() => { if (tab === "parc") loadEvaluaciones(); }, [tab]);
 
+  // ── CIERRE DE CURSADA ──
+  const loadCierre = async () => {
+    setLoadingCierre(true); setError(""); setCierreErrors([]); setCierreSaved(false);
+    try {
+      const results = await Promise.all(coms.map((c) =>
+        api.getCierre(c.hash)
+          .then((data) => ({ comisionHash: c.hash, comisionId: c.id, ok: true, data }))
+          .catch((e) => ({ comisionHash: c.hash, comisionId: c.id, ok: false, error: e.message }))
+      ));
+      const merged = [];
+      const meta = {};
+      let condiciones = [];
+      const errs = [];
+      for (const r of results) {
+        if (!r.ok) { errs.push({ comisionId: r.comisionId, error: r.error }); continue; }
+        meta[r.comisionHash] = { edicionHash: r.data.edicionHash, comisionId: r.comisionId };
+        if (r.data.condiciones?.length && !condiciones.length) condiciones = r.data.condiciones;
+        for (const a of r.data.alumnos || []) {
+          merged.push({ ...a, comisionHash: r.comisionHash, comisionId: r.comisionId, edicionHash: r.data.edicionHash });
+        }
+      }
+      merged.sort((a, b) => (a.nombre || "").localeCompare((b.nombre || ""), "es", { sensitivity: "base" }));
+      setCierreAlumnos(merged);
+      setCierreCondiciones(condiciones);
+      setCierreMeta(meta);
+      setCierreErrors(errs);
+    } catch (e) { setError(e.message); }
+    finally { setLoadingCierre(false); }
+  };
+
+  useEffect(() => { if (tab === "cierre") loadCierre(); }, [tab]);
+
+  const setCierreField = (renglonKey, field, value) => {
+    setCierreAlumnos((prev) => prev.map((a) => {
+      if (`${a.comisionHash}:${a.renglonId}` !== renglonKey) return a;
+      const next = { ...a, [field]: value };
+      // Auto-derive resultado from condición (SIU: condición tiene data-resultado)
+      if (field === "condRegularidad") {
+        const cond = cierreCondiciones.find((c) => c.value === value);
+        if (cond && cond.resultado) next.resultadoCursada = cond.resultado;
+      }
+      return next;
+    }));
+    setCierreSaved(false);
+  };
+
+  const guardarCierre = async () => {
+    setSavingCierre(true); setError(""); setCierreSaved(false); setCierreErrors([]);
+    try {
+      // Group by comisionHash → save to each edicionHash
+      const byCom = {};
+      for (const a of cierreAlumnos) {
+        if (!byCom[a.comisionHash]) byCom[a.comisionHash] = [];
+        byCom[a.comisionHash].push({
+          renglonId: a.renglonId,
+          notaCursada: a.notaCursada, resultadoCursada: a.resultadoCursada, condRegularidad: a.condRegularidad,
+          fechaRegular: a.fechaRegular,
+          notaPromocion: a.notaPromocion, resultadoPromocion: a.resultadoPromocion, fechaPromocion: a.fechaPromocion,
+        });
+      }
+      const results = await Promise.all(Object.entries(byCom).map(async ([comHash, alums]) => {
+        const meta = cierreMeta[comHash];
+        if (!meta) return { ok: false, comisionId: comHash };
+        try {
+          const r = await api.guardarCierre(meta.edicionHash, alums);
+          return { ok: r.ok, comisionId: meta.comisionId };
+        } catch (e) { return { ok: false, comisionId: meta.comisionId, error: e.message }; }
+      }));
+      const failed = results.filter((r) => !r.ok);
+      if (failed.length === 0) { setCierreSaved(true); setTimeout(() => setCierreSaved(false), 3000); }
+      else setError(`Falló el guardado en ${failed.length} comisión(es): ${failed.map((f) => f.comisionId || "?").join(", ")}`);
+    } catch (e) { setError(e.message); }
+    finally { setSavingCierre(false); }
+  };
+
   // ── TEMAS ──
   const loadTema = async (clase) => {
     setSelectedTemaClase(clase); setLoadingTema(true); setError(""); setTemaSaved(false); setTemaText("");
@@ -970,7 +1054,7 @@ function Unified({ coms, onBack }) {
 
   const pres = alumnos.filter((a) => a.estado === 0).length;
   const aus = alumnos.filter((a) => a.estado > 0).length;
-  const tabs = [{ id: "asist", l: "Asistencia", i: ico.clip }, { id: "parc", l: "Parciales", i: ico.cal }, { id: "tem", l: "Temas", i: ico.edit }, { id: "cls", l: "Clases", i: ico.list }];
+  const tabs = [{ id: "asist", l: "Asistencia", i: ico.clip }, { id: "parc", l: "Parciales", i: ico.cal }, { id: "tem", l: "Temas", i: ico.edit }, { id: "cierre", l: "Cierre", i: ico.award }, { id: "cls", l: "Clases", i: ico.list }];
 
   return (
     <div className="space-y-4">
@@ -1246,6 +1330,111 @@ function Unified({ coms, onBack }) {
             </>
           )}
         </div>
+      )}
+
+      {/* ── CIERRE DE CURSADA ── */}
+      {tab === "cierre" && (
+        loadingCierre ? <LoadingScreen message="Cargando acta de cierre..." /> : (
+          <div className="space-y-3">
+            {coms.length > 1 && (
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg text-xs" style={{ background: t.blueBg, border: `1px solid ${t.blueBorder}`, color: t.blueText }}>
+                <span className="shrink-0 mt-px">{ico.warn}</span> Vista unificada: el cierre se guarda en cada comisión por separado. Cada alumno muestra su comisión.
+              </div>
+            )}
+
+            {cierreErrors.length > 0 && (
+              <div className="flex flex-col gap-1 px-3 py-2 rounded-lg text-xs" style={{ background: t.yellowBg, border: `1px solid ${t.yellowBorder}`, color: t.yellowText }}>
+                {cierreErrors.map((e, i) => (
+                  <div key={i}><strong>{e.comisionId}:</strong> {e.error}</div>
+                ))}
+              </div>
+            )}
+
+            {cierreAlumnos.length === 0 && cierreErrors.length === 0 && (
+              <div className="text-center py-10">
+                <div className="text-3xl mb-2">📋</div>
+                <p className="text-sm" style={{ color: t.textMut }}>No hay actas de cierre abiertas para cargar.</p>
+              </div>
+            )}
+
+            {cierreAlumnos.length > 0 && (
+              <div className="flex items-center justify-between text-xs px-1" style={{ color: t.textMut }}>
+                <span>{cierreAlumnos.length} alumno{cierreAlumnos.length !== 1 ? "s" : ""}</span>
+                <span>Asistencia · Condición · Nota</span>
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              {cierreAlumnos.map((a) => {
+                const key = `${a.comisionHash}:${a.renglonId}`;
+                const asist = parseFloat(a.asistencia);
+                const asistColor = isNaN(asist) ? t.textMut : asist >= 75 ? t.greenText : asist >= 50 ? t.yellowText : t.redText;
+                const asistBg = isNaN(asist) ? t.ghost : asist >= 75 ? t.greenBg : asist >= 50 ? t.yellowBg : t.redBg;
+                const res = a.resultadoCursada;
+                const resLabel = res === "A" ? "Aprobado" : res === "R" ? "Reprobado" : res === "U" ? "Ausente" : "—";
+                const resColor = res === "A" ? t.greenText : res === "R" ? t.redText : res === "U" ? t.yellowText : t.textMut;
+                return (
+                  <div key={key} className="px-3 py-2.5 rounded-lg" style={{ background: t.surface, boxShadow: `inset 0 0 0 1px ${t.surfaceBorder}` }}>
+                    <div className="flex items-center justify-between gap-2 mb-2 flex-wrap">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium truncate" style={{ color: t.text }}>{a.nombre}</div>
+                        <div className="flex items-center gap-2 text-xs flex-wrap" style={{ color: t.textFaint }}>
+                          {a.dni && <span>{a.dni}</span>}
+                          {coms.length > 1 && a.comisionId && <span className="px-1.5 py-0.5 rounded" style={{ background: t.ghost, color: t.ghostText }}>{a.comisionId}</span>}
+                        </div>
+                      </div>
+                      <div className="px-2 py-1 rounded-lg text-xs font-bold text-center" title="% de asistencia"
+                        style={{ background: asistBg, color: asistColor, border: `1px solid ${t.surfaceBorder}` }}>
+                        {isNaN(asist) ? "—" : `${a.asistencia}%`}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      {/* Condición */}
+                      <select value={a.condRegularidad ?? ""} onChange={(e) => setCierreField(key, "condRegularidad", e.target.value)}
+                        className="flex-1 min-w-[120px] px-2 py-1.5 rounded-lg text-sm outline-none cursor-pointer"
+                        style={{ background: t.inputBg, color: t.text, border: `1px solid ${t.inputBorder}` }}>
+                        <option value="" style={{ background: t.optBg }}>Condición…</option>
+                        {cierreCondiciones.map((c) => (
+                          <option key={c.value} value={c.value} style={{ background: t.optBg }}>{c.label}</option>
+                        ))}
+                      </select>
+                      {/* Nota */}
+                      <select value={a.notaCursada ?? ""} onChange={(e) => setCierreField(key, "notaCursada", e.target.value)}
+                        className="w-16 px-2 py-1.5 rounded-lg text-sm font-bold text-center outline-none cursor-pointer"
+                        style={{ background: t.inputBg, color: t.text, border: `1px solid ${t.inputBorder}` }}>
+                        <option value="" style={{ background: t.optBg }}>—</option>
+                        {[0,1,2,3,4,5,6,7,8,9,10].map((n) => (
+                          <option key={n} value={n.toString()} style={{ background: t.optBg }}>{n}</option>
+                        ))}
+                      </select>
+                      {/* Resultado (derivado de condición, editable) */}
+                      <select value={a.resultadoCursada ?? ""} onChange={(e) => setCierreField(key, "resultadoCursada", e.target.value)}
+                        className="w-24 px-2 py-1.5 rounded-lg text-xs font-semibold text-center outline-none cursor-pointer"
+                        style={{ background: t.inputBg, color: resColor, border: `1px solid ${t.inputBorder}` }}>
+                        <option value="" style={{ background: t.optBg }}>Resultado</option>
+                        <option value="A" style={{ background: t.optBg }}>Aprobado</option>
+                        <option value="R" style={{ background: t.optBg }}>Reprobado</option>
+                        <option value="U" style={{ background: t.optBg }}>Ausente</option>
+                      </select>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {cierreAlumnos.length > 0 && (
+              <div className="sticky bottom-4 pt-2">
+                <button onClick={guardarCierre} disabled={savingCierre}
+                  className="w-full py-3 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white shadow-lg hover:brightness-110 active:scale-[0.99] transition-all"
+                  style={{ background: cierreSaved ? "#16a34a" : "linear-gradient(135deg, #22c55e, #16a34a)" }}>
+                  {savingCierre ? <><Spinner size={16} /> Guardando...</>
+                    : cierreSaved ? <>{ico.chk} ¡Cierre guardado{coms.length > 1 ? ` en ${Object.keys(cierreMeta).length} comisiones` : ""}!</>
+                    : <>Guardar cierre{coms.length > 1 ? ` (${Object.keys(cierreMeta).length} comisiones)` : ""}</>}
+                </button>
+              </div>
+            )}
+          </div>
+        )
       )}
 
       {/* ── CLASES TABLE ── */}
