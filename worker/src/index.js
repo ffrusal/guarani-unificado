@@ -210,6 +210,19 @@ function parseAlumnos(rawText) {
 }
 
 // ── Parse cierre de cursada (cursada/edicion page) ──
+// Robustly unescape SIU's on_arrival JSON-string content WITHOUT depending on a full
+// JSON.parse succeeding (the page has 4 huge blobs; if one is malformed, JSON.parse-based
+// extraction silently drops the renglones blob). This handles \/ \" \n \t \uXXXX in place.
+function unescapeJsonish(s) {
+  if (!s) return "";
+  return s
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\r/g, "\r");
+}
 // Each student has a regular row + a promocion row, both with renglones[ID][field] inputs/selects.
 function cursadaInputValue(chunk, id, field) {
   const re = new RegExp(`name=['"]renglones\\[${id}\\]\\[${field}\\]['"][^>]*?value=['"]([^'"]*)['"]`);
@@ -255,16 +268,18 @@ function cursadaCondiciones(chunk, id) {
   return opts;
 }
 function parseCursadaEdicion(raw) {
-  const comMatch = raw.match(/id=["']comision["'][^>]*>(\d+)</);
+  // Unescape SIU's on_arrival content robustly (no JSON.parse dependency).
+  const html = unescapeJsonish(raw);
+  const comMatch = html.match(/id=["']comision["'][^>]*>(\d+)</);
   const comisionId = comMatch ? comMatch[1] : null;
-  const guardarMatch = raw.match(/cursada\/guardar\/([a-f0-9]+)\/(\d+)/);
+  const guardarMatch = html.match(/cursada\/guardar\/([a-f0-9]+)\/(\d+)/);
   const guardarHash = guardarMatch ? guardarMatch[1] : null;
   const instancia = guardarMatch ? guardarMatch[2] : "1";
 
   const alumnos = [];
   const rowRe = /<tr id=['"]renglon_(\d+)['"][^>]*data-renglon=["']\d+["'][^>]*>([\s\S]*?)<\/tr>\s*<tr class=['"]js-renglon-promocion[\s\S]*?<\/tr>/g;
   let m;
-  while ((m = rowRe.exec(raw)) !== null) {
+  while ((m = rowRe.exec(html)) !== null) {
     const id = m[1];
     const pair = m[0];
     const nombreM = pair.match(/class=["']nombre["']>([^<]+)</);
@@ -288,7 +303,7 @@ function parseCursadaEdicion(raw) {
   }
   // Sort alphabetically
   alumnos.sort((a, b) => (a.nombre || "").localeCompare((b.nombre || ""), "es", { sensitivity: "base" }));
-  const condiciones = alumnos.length ? cursadaCondiciones(raw, parseCursadaFirstRenglonId(raw)) : [];
+  const condiciones = alumnos.length ? cursadaCondiciones(html, parseCursadaFirstRenglonId(html)) : [];
   return { comisionId, guardarHash, instancia, alumnos, condiciones };
 }
 function parseCursadaFirstRenglonId(raw) {
@@ -301,14 +316,17 @@ async function resolveCierreEdicion(comisionHash, session) {
   const verRes = await gFetch(`evaluaciones/ver_comision/${comisionHash}`, session);
   const verRaw = await gText(verRes);
   if (verRaw.includes("acceso/login")) return { error: "Sesión expirada", status: 401 };
-  const cierreMatch = verRaw.match(/cierre_cursadas\/([a-f0-9]+)/);
+  // Unescape robustly (SIU escapes slashes as \/ inside on_arrival JSON)
+  const verContent = unescapeJsonish(verRaw);
+  const cierreMatch = verContent.match(/cierre_cursadas\/([a-f0-9]+)/);
   if (!cierreMatch) return { error: "No se encontró el acta de cierre para esta comisión" };
   const cierreHash = cierreMatch[1];
   // 2) cierre_cursadas page → cursada/edicion link ("Carga de notas")
   const cierreRes = await gFetch(`cierre_cursadas/${cierreHash}`, session);
   const cierreRaw = await gText(cierreRes);
-  const edMatch = cierreRaw.match(/cursada\/edicion\/([a-f0-9]+)/);
-  if (!edMatch) return { error: "No hay actas abiertas para cargar (puede que ya esté cerrada)" };
+  const cierreContent = unescapeJsonish(cierreRaw);
+  const edMatch = cierreContent.match(/cursada\/edicion\/([a-f0-9]+)/);
+  if (!edMatch) return { error: "No hay actas abiertas para cargar (puede que ya esté cerrada)", debug: { cierreHash, cierreLen: cierreRaw.length } };
   return { cierreHash, edicionHash: edMatch[1] };
 }
 
@@ -1140,13 +1158,30 @@ async function handleRequest(request, env) {
       const session = request.headers.get("Authorization");
       if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
       const comisionHash = path.replace("/api/cierre/", "");
+      const wantDebug = url.searchParams.get("debug") === "1";
       const resolved = await resolveCierreEdicion(comisionHash, session);
-      if (resolved.error) return Response.json({ error: resolved.error }, { status: resolved.status || 400, headers: cors });
+      if (resolved.error) return Response.json({ error: resolved.error, debug: resolved.debug }, { status: resolved.status || 400, headers: cors });
       const edRes = await gFetch(`cursada/edicion/${resolved.edicionHash}`, session);
       const edRaw = await gText(edRes);
       if (edRaw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
       const data = parseCursadaEdicion(edRaw);
-      return Response.json({ ...data, edicionHash: resolved.edicionHash }, { headers: cors });
+      const resp = { ...data, edicionHash: resolved.edicionHash };
+      if (data.alumnos.length === 0 || wantDebug) {
+        // Diagnostics: help pinpoint why no rows were parsed
+        const html = unescapeJsonish(edRaw);
+        resp.debug = {
+          edicionHash: resolved.edicionHash,
+          rawLen: edRaw.length,
+          htmlLen: html.length,
+          hasComisionSpan: /id=["']comision["']/.test(html),
+          hasRenglonTr: /renglon_\d+/.test(html),
+          renglonCount: (html.match(/<tr id=['"]renglon_\d+/g) || []).length,
+          hasPromocionTr: /js-renglon-promocion/.test(html),
+          guardarHash: data.guardarHash,
+          sample: html.substring(html.indexOf("renglon_") >= 0 ? html.indexOf("renglon_") - 20 : 0, (html.indexOf("renglon_") >= 0 ? html.indexOf("renglon_") - 20 : 0) + 600),
+        };
+      }
+      return Response.json(resp, { headers: cors });
     }
 
     // ── CIERRE DE CURSADA: POST guardar (merge incoming changes, send full form) ──
