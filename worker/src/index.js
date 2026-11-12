@@ -121,14 +121,16 @@ function parseComisiones(rawText) {
     const rowPos = content.indexOf(row[0]);
     const before = content.substring(Math.max(0, rowPos - 500), rowPos);
     let materia = "Sin nombre";
-    const materiaMatch = before.match(/class=['"]header-actividad['"][^>]*>([\s\S]*?)<\/th>/);
+    let codigo = "";
+    const headers = [...before.matchAll(/class=['"]header-actividad['"][^>]*>([\s\S]*?)<\/th>/g)];
+    const materiaMatch = headers.length ? headers[headers.length - 1] : null;
     if (materiaMatch) {
       materia = materiaMatch[1].replace(/<[^>]*>/g, "").trim();
-      const codeMatch = materia.match(/^(.+?)\s*\([^)]+\)\s*$/);
-      if (codeMatch) materia = codeMatch[1].trim();
+      const codeMatch = materia.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+      if (codeMatch) { materia = codeMatch[1].trim(); codigo = codeMatch[2].trim(); }
     }
     comisiones.push({
-      id: comisionId, hash, materia,
+      id: comisionId, hash, materia, codigo,
       subcomision: clean(1), ubicacion: clean(2),
       responsabilidad: clean(3), turno: clean(4),
       inscriptos: parseInt(clean(5)) || 0,
@@ -497,6 +499,47 @@ function parseNotasPage(rawText) {
 }
 
 // ── Routes ──
+
+// ── Parse mesas de examen (zona_examenes) ──
+function decodeEntities(s) {
+  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)));
+}
+
+function parseMesas(rawText) {
+  const content = extractAllContents(rawText) || extractContent(rawText);
+  const mesas = [];
+  const tables = content.split(/<table/i).slice(1);
+  for (const tbl of tables) {
+    const hm = tbl.match(/class=['"]header-actividad['"][^>]*>([\s\S]*?)<\/th>/);
+    if (!hm) continue;
+    let materia = decodeEntities(hm[1].replace(/<[^>]*>/g, "").trim());
+    let codigo = "";
+    const cm = materia.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
+    if (cm) { materia = cm[1].trim(); codigo = cm[2].trim(); }
+    const rows = extractAll(tbl, /<tr[^>]*data-link=['"](.*?)['"][^>]*>([\s\S]*?)<\/tr>/g);
+    for (const row of rows) {
+      const hashMatch = row[1].match(/home\/([a-f0-9]+)/);
+      const tds = extractAll(row[2], /<td[^>]*>([\s\S]*?)<\/td>/g)
+        .map((m) => decodeEntities(m[1].replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim()));
+      if (tds.length < 2) continue;
+      const fm = tds[0].match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+      const fechaISO = fm ? `${fm[3]}-${fm[2]}-${fm[1]}` : null;
+      const hora = fm && fm[4] ? `${fm[4].padStart(2, "0")}:${fm[5]}` : "";
+      mesas.push({
+        hash: hashMatch ? hashMatch[1] : null,
+        materia, codigo,
+        fecha: tds[0], fechaISO, hora,
+        mesa: tds[1] || "", turno: tds[2] || "", llamado: tds[3] || "",
+        ubicacion: tds[4] || "", lugar: tds[5] && tds[5] !== "-" ? tds[5] : "",
+      });
+    }
+  }
+  mesas.sort((a, b) => ((a.fechaISO || "") + a.hora).localeCompare((b.fechaISO || "") + b.hora));
+  return mesas;
+}
+
 async function handleRequest(request, env) {
   const url = new URL(request.url);
   const origin = request.headers.get("Origin");
@@ -591,6 +634,42 @@ async function handleRequest(request, env) {
       if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
       const comisiones = parseComisiones(raw);
       return Response.json({ comisiones }, { headers: cors });
+    }
+
+    // ── MESAS DE EXAMEN (finales) ──
+    if (path === "/api/finales" && request.method === "GET") {
+      const session = request.headers.get("Authorization");
+      if (!session) return Response.json({ error: "No session" }, { status: 401, headers: cors });
+      const desde = url.searchParams.get("desde"); // dd/mm/aaaa
+      const hasta = url.searchParams.get("hasta");
+      const dateRe = /^\d{2}\/\d{2}\/\d{4}$/;
+      let raw = null, mesas = [];
+      if (desde && hasta && dateRe.test(desde) && dateRe.test(hasta)) {
+        try {
+          const body = new URLSearchParams({ filtrar_por: "r", fecha: desde, desde, hasta }).toString();
+          const res = await gFetch("zona_examenes", session, {
+            method: "POST", body,
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+              "Origin": "https://autogestion.usal.edu.ar",
+              "Referer": `${BASE}/zona_examenes`,
+            },
+          });
+          raw = await gText(res);
+          mesas = parseMesas(raw);
+        } catch (e) { console.log("finales POST error:", e.message); }
+      }
+      if (!raw || (mesas.length === 0 && !raw.includes("header-actividad"))) {
+        const res = await gFetch("zona_examenes", session);
+        raw = await gText(res);
+        mesas = parseMesas(raw);
+      }
+      if (raw.includes("acceso/login")) return Response.json({ error: "Sesión expirada" }, { status: 401, headers: cors });
+      const rango = {
+        desde: raw.match(/name=\\?"desde\\?"[^>]*value=\\?"([\d\\/]+)/)?.[1]?.replace(/\\/g, "") || desde || null,
+        hasta: raw.match(/name=\\?"hasta\\?"[^>]*value=\\?"([\d\\/]+)/)?.[1]?.replace(/\\/g, "") || hasta || null,
+      };
+      return Response.json({ mesas, rango }, { headers: cors });
     }
 
     // ── CLASES ──

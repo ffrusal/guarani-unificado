@@ -1,4 +1,4 @@
-import { useState, useEffect, createContext, useContext } from "react";
+import { useState, useEffect, useRef, createContext, useContext } from "react";
 import * as api from "./api";
 
 const ThemeCtx = createContext();
@@ -1474,14 +1474,410 @@ function Unified({ coms, onBack }) {
 }
 
 // ── MAIN ──
+// ── FINALES (calendario de mesas de examen) ──
+const SIU_BASE = "https://autogestion.usal.edu.ar/autogestion";
+const MESES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+const DIAS_CORTOS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+const DIAS_LARGOS = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+const MATERIA_HUES = [142, 217, 32, 280, 350, 190, 48, 0, 260, 160, 320, 85];
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const isoOf = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const dmyOf = (d) => `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)}/${d.getFullYear()}`;
+const parseISO = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const fechaLarga = (iso) => { const d = parseISO(iso); const s = `${DIAS_LARGOS[d.getDay()]} ${d.getDate()} de ${MESES[d.getMonth()].toLowerCase()}`; return s[0].toUpperCase() + s.slice(1); };
+const normTxt = (s) => (s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+
+function materiaColor(hue, dark) {
+  return dark
+    ? { bg: `hsla(${hue},70%,55%,0.16)`, border: `hsla(${hue},70%,60%,0.35)`, text: `hsl(${hue},75%,72%)`, dot: `hsl(${hue},70%,60%)` }
+    : { bg: `hsla(${hue},70%,45%,0.10)`, border: `hsla(${hue},70%,40%,0.25)`, text: `hsl(${hue},70%,30%)`, dot: `hsl(${hue},65%,45%)` };
+}
+
+// Agrupa mesas del mismo día/hora/materia/sede (p. ej. varios planes de "Ética Profesional" a las 19:00)
+function agruparMesas(mesas) {
+  const map = new Map();
+  for (const m of mesas) {
+    if (!m.fechaISO) continue;
+    const key = `${m.fechaISO}|${m.hora}|${normTxt(m.materia)}|${normTxt(m.ubicacion)}`;
+    if (!map.has(key)) map.set(key, { key, fechaISO: m.fechaISO, hora: m.hora, materia: m.materia, ubicacion: m.ubicacion, llamado: m.llamado, turno: m.turno, mesas: [] });
+    map.get(key).mesas.push(m);
+  }
+  return [...map.values()].sort((a, b) => (a.fechaISO + a.hora).localeCompare(b.fechaISO + b.hora));
+}
+
+// Comisiones de cursada que corresponden a una mesa: primero por código de actividad, si no por nombre de materia
+function comisionesDeGrupo(grupo, comisiones) {
+  const codigos = new Set(grupo.mesas.map((m) => m.codigo).filter(Boolean));
+  const porCodigo = comisiones.filter((c) => c.codigo && codigos.has(c.codigo));
+  const mismaMateria = comisiones.filter((c) => normTxt(c.materia) === normTxt(grupo.materia));
+  return { sugeridas: porCodigo.length ? porCodigo : mismaMateria, mismaMateria, porCodigo: porCodigo.length > 0 };
+}
+
+function MesaModal({ grupo, comisiones, color, cache, onClose }) {
+  const t = useTheme();
+  const { sugeridas, mismaMateria, porCodigo } = comisionesDeGrupo(grupo, comisiones);
+  const [selHashes, setSelHashes] = useState(() => new Set(sugeridas.map((c) => c.hash)));
+  const [mostrarOtras, setMostrarOtras] = useState(false);
+  const [alumnos, setAlumnos] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [q, setQ] = useState("");
+  const [copiado, setCopiado] = useState(false);
+
+  const opciones = mostrarOtras ? comisiones : (mismaMateria.length ? mismaMateria : sugeridas);
+  const comById = Object.fromEntries(comisiones.map((c) => [c.hash, c]));
+
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    const hashes = [...selHashes].sort();
+    if (hashes.length === 0) { setAlumnos([]); return; }
+    const key = hashes.join(",");
+    if (cache.current.has(key)) { setAlumnos(cache.current.get(key)); return; }
+    let cancel = false;
+    setLoading(true); setError("");
+    api.getAsistenciaUnificada(hashes)
+      .then((data) => { if (cancel) return; const al = data.alumnos || []; cache.current.set(key, al); setAlumnos(al); })
+      .catch((e) => { if (!cancel) setError(e.message); })
+      .finally(() => { if (!cancel) setLoading(false); });
+    return () => { cancel = true; };
+  }, [selHashes]);
+
+  const toggle = (h) => setSelHashes((p) => { const n = new Set(p); n.has(h) ? n.delete(h) : n.add(h); return n; });
+  const filtrados = (alumnos || []).filter((a) => !q || normTxt(a.nombre).includes(normTxt(q)) || (a.legajo || "").includes(q.trim()));
+
+  const copiar = async () => {
+    const txt = filtrados.map((a) => `${a.legajo || ""}\t${a.nombre}`).join("\n");
+    try { await navigator.clipboard.writeText(txt); setCopiado(true); setTimeout(() => setCopiado(false), 1500); } catch (e) {}
+  };
+
+  const dato = (label, value) => value ? (
+    <div className="min-w-0"><div className="text-[11px] uppercase tracking-wide" style={{ color: t.textMut }}>{label}</div><div className="text-sm" style={{ color: t.text }}>{value}</div></div>
+  ) : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center sm:p-4" style={{ background: t.modalOv }} onClick={onClose}>
+      <div className="w-full sm:max-w-2xl rounded-t-2xl sm:rounded-2xl max-h-[92vh] flex flex-col"
+        style={{ background: t.modalBg, border: `1px solid ${t.surfaceBorder}` }} onClick={(e) => e.stopPropagation()}>
+        <div className="p-5 pb-3 space-y-3" style={{ borderBottom: `1px solid ${t.surfaceBorder}` }}>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: color.dot }} />
+                <h3 className="text-base font-bold truncate" style={{ color: t.text }}>{grupo.materia}</h3>
+              </div>
+              <p className="text-sm mt-0.5" style={{ color: t.textSec }}>{fechaLarga(grupo.fechaISO)} · {grupo.hora || "sin hora"}</p>
+            </div>
+            <button onClick={onClose} className="text-lg shrink-0" style={{ color: t.textMut }}>✕</button>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2">
+            {dato("Sede", grupo.ubicacion)}
+            {dato("Llamado", grupo.llamado)}
+            {dato("Turno", grupo.turno)}
+            {dato("Lugar", grupo.mesas.map((m) => m.lugar).filter(Boolean).join(", "))}
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {grupo.mesas.map((m) => (
+              <a key={m.hash || m.mesa} href={m.hash ? `${SIU_BASE}/zona_examenes/home/${m.hash}` : undefined} target="_blank" rel="noreferrer"
+                title="Abrir la mesa en SIU Guaraní" className="px-2 py-1 rounded-md text-xs flex items-center gap-1 hover:brightness-95"
+                style={{ background: color.bg, color: color.text, boxShadow: `inset 0 0 0 1px ${color.border}` }}>
+                {m.mesa} <span style={{ opacity: 0.7 }}>({m.codigo})</span> {m.hash && ico.link}
+              </a>
+            ))}
+          </div>
+        </div>
+
+        <div className="p-5 pt-3 space-y-3 overflow-y-auto">
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-sm font-semibold" style={{ color: t.text }}>Alumnos de cursada</h4>
+            <span className="text-xs" style={{ color: t.textMut }}>Lista de asistencia, no inscriptos a la mesa</span>
+          </div>
+
+          {opciones.length === 0 && !mostrarOtras ? (
+            <div className="px-3 py-2 rounded-lg text-xs" style={{ background: t.yellowBg, border: `1px solid ${t.yellowBorder}`, color: t.yellowText }}>
+              No encontré una comisión de cursada para esta materia.{" "}
+              <button className="underline" onClick={() => setMostrarOtras(true)}>Elegir manualmente</button>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {!porCodigo && sugeridas.length > 0 && !mostrarOtras && (
+                <p className="text-xs" style={{ color: t.textMut }}>Sin coincidencia exacta de código; te muestro las comisiones de {grupo.materia}.</p>
+              )}
+              <div className="flex flex-wrap gap-1.5">
+                {opciones.map((c) => {
+                  const on = selHashes.has(c.hash);
+                  return (
+                    <button key={c.hash} onClick={() => toggle(c.hash)} className="px-2.5 py-1 rounded-full text-xs flex items-center gap-1.5"
+                      title={`${c.materia}${c.codigo ? ` (${c.codigo})` : ""}`}
+                      style={on ? { background: t.greenBg, color: t.greenText, boxShadow: `inset 0 0 0 1px ${t.greenBorder}` } : { background: t.ghost, color: t.ghostText }}>
+                      <span className="w-3.5 h-3.5 rounded flex items-center justify-center" style={on ? { background: "#22c55e" } : { boxShadow: `inset 0 0 0 1px ${t.checkBorder}` }}>{on && ico.chk}</span>
+                      {c.id}{mostrarOtras && <span style={{ opacity: 0.6 }}>· {c.materia}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+              <button onClick={() => setMostrarOtras((v) => !v)} className="text-xs underline" style={{ color: t.textMut }}>
+                {mostrarOtras ? "Mostrar solo las de esta materia" : "Ver todas mis comisiones"}
+              </button>
+            </div>
+          )}
+
+          {error && <ErrorBanner message={error} onDismiss={() => setError("")} />}
+
+          {selHashes.size > 0 && (
+            loading ? <LoadingScreen message="Cargando alumnos..." /> : alumnos && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Buscar por nombre o legajo"
+                    className="flex-1 min-w-0 px-3 py-2 rounded-lg text-sm outline-none" style={{ background: t.inputBg, color: t.text, border: `1px solid ${t.inputBorder}` }} />
+                  <button onClick={copiar} className="px-3 py-2 rounded-lg text-xs shrink-0" style={{ background: t.ghost, color: t.ghostText }}>{copiado ? "✓ Copiado" : "Copiar"}</button>
+                </div>
+                <p className="text-xs" style={{ color: t.textMut }}>{filtrados.length} de {alumnos.length} alumnos</p>
+                <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${t.surfaceBorder}` }}>
+                  {filtrados.map((a, i) => (
+                    <div key={a.hash} className="px-3 py-2 flex items-center justify-between gap-3 text-sm"
+                      style={{ borderTop: i ? `1px solid ${t.tblBorder}` : "none", background: i % 2 ? t.rowHover : "transparent" }}>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="text-xs w-6 text-right shrink-0" style={{ color: t.textFaint }}>{i + 1}</span>
+                        <span className="truncate" style={{ color: t.text }}>{a.nombre}</span>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        {selHashes.size > 1 && (a.comisiones || []).map((h) => (
+                          <span key={h} className="hidden sm:inline px-1.5 py-0.5 rounded text-[10px]" style={{ background: t.ghost, color: t.textMut }}>{comById[h]?.id || "?"}</span>
+                        ))}
+                        <span className="text-xs tabular-nums" style={{ color: t.textMut }}>{a.legajo}</span>
+                      </div>
+                    </div>
+                  ))}
+                  {filtrados.length === 0 && <div className="px-3 py-4 text-center text-sm" style={{ color: t.textMut }}>Sin alumnos</div>}
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Finales({ dark }) {
+  const t = useTheme();
+  const hoy = new Date();
+  const hoyISO = isoOf(hoy);
+  const [mes, setMes] = useState(() => new Date(hoy.getFullYear(), hoy.getMonth(), 1));
+  const [mesas, setMesas] = useState([]);
+  const [comisiones, setComisiones] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingMes, setLoadingMes] = useState(false);
+  const [error, setError] = useState("");
+  const [vista, setVista] = useState(() => (typeof window !== "undefined" && window.innerWidth < 640 ? "lista" : "mes"));
+  const [diaSel, setDiaSel] = useState(null);
+  const [grupoSel, setGrupoSel] = useState(null);
+  const [ocultas, setOcultas] = useState(new Set());
+  const [cargados] = useState(() => new Set());
+  const alumnosCache = useRef(new Map());
+
+  const mesKey = (d) => `${d.getFullYear()}-${d.getMonth()}`;
+  const merge = (nuevas) => setMesas((prev) => {
+    const m = new Map(prev.map((x) => [x.hash || `${x.mesa}|${x.fecha}`, x]));
+    nuevas.forEach((x) => m.set(x.hash || `${x.mesa}|${x.fecha}`, x));
+    return [...m.values()];
+  });
+
+  const fetchRango = async (desdeD, hastaD) => {
+    const data = await api.getFinales(dmyOf(desdeD), dmyOf(hastaD));
+    merge(data.mesas || []);
+    for (let d = new Date(desdeD.getFullYear(), desdeD.getMonth(), 1); d <= hastaD; d = new Date(d.getFullYear(), d.getMonth() + 1, 1)) cargados.add(mesKey(d));
+  };
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true); setError("");
+      try {
+        const desde = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
+        const hasta = new Date(hoy.getFullYear(), hoy.getMonth() + 3, 0);
+        const [, cs] = await Promise.all([fetchRango(desde, hasta), api.getComisionesClases().catch(() => ({ comisiones: [] }))]);
+        setComisiones(cs.comisiones || []);
+      } catch (e) { setError(e.message); }
+      finally { setLoading(false); }
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (loading || cargados.has(mesKey(mes))) return;
+    setLoadingMes(true);
+    fetchRango(mes, new Date(mes.getFullYear(), mes.getMonth() + 1, 0))
+      .catch((e) => setError(e.message))
+      .finally(() => setLoadingMes(false));
+  }, [mes, loading]);
+
+  const materias = [...new Set(mesas.map((m) => m.materia))].sort((a, b) => a.localeCompare(b, "es"));
+  const colorDe = (materia) => materiaColor(MATERIA_HUES[Math.max(0, materias.indexOf(materia)) % MATERIA_HUES.length], dark);
+  const grupos = agruparMesas(mesas.filter((m) => !ocultas.has(m.materia)));
+  const porDia = {};
+  grupos.forEach((g) => { (porDia[g.fechaISO] ||= []).push(g); });
+
+  const toggleMateria = (m) => setOcultas((p) => { const n = new Set(p); n.has(m) ? n.delete(m) : n.add(m); return n; });
+  const moverMes = (delta) => { setMes((d) => new Date(d.getFullYear(), d.getMonth() + delta, 1)); setDiaSel(null); };
+
+  // Celdas del mes (semana empieza el lunes)
+  const primerDia = (mes.getDay() + 6) % 7;
+  const diasMes = new Date(mes.getFullYear(), mes.getMonth() + 1, 0).getDate();
+  const celdas = [];
+  for (let i = 0; i < primerDia; i++) celdas.push(null);
+  for (let d = 1; d <= diasMes; d++) celdas.push(new Date(mes.getFullYear(), mes.getMonth(), d));
+  while (celdas.length % 7) celdas.push(null);
+
+  const gruposMes = grupos.filter((g) => g.fechaISO.startsWith(`${mes.getFullYear()}-${pad2(mes.getMonth() + 1)}`));
+  const proximo = grupos.find((g) => g.fechaISO >= hoyISO);
+
+  if (loading) return <LoadingScreen message="Cargando mesas de examen desde Guaraní..." />;
+
+  const Chip = ({ g, compact }) => {
+    const c = colorDe(g.materia);
+    const pasado = g.fechaISO < hoyISO;
+    return (
+      <button onClick={(e) => { e.stopPropagation(); setGrupoSel(g); }} title={`${g.hora} ${g.materia} · ${g.ubicacion}`}
+        className={`w-full text-left rounded-md truncate hover:brightness-95 ${compact ? "px-1 py-0.5 text-[10px] sm:text-[11px]" : "px-3 py-2 text-sm"}`}
+        style={{ background: c.bg, color: c.text, boxShadow: `inset 2px 0 0 ${c.dot}`, opacity: pasado ? 0.5 : 1 }}>
+        <span className="font-semibold tabular-nums">{g.hora}</span> {g.materia}{g.mesas.length > 1 && <span style={{ opacity: 0.7 }}> ×{g.mesas.length}</span>}
+      </button>
+    );
+  };
+
+  const ListaDia = ({ iso, items }) => (
+    <div className="rounded-xl overflow-hidden" style={{ background: t.surface, border: `1px solid ${iso === hoyISO ? t.greenBorder : t.surfaceBorder}` }}>
+      <div className="px-4 py-2 text-sm font-semibold flex items-center justify-between" style={{ background: t.ghost, color: t.text }}>
+        <span>{fechaLarga(iso)}</span>{iso === hoyISO && <span className="text-xs" style={{ color: t.greenText }}>Hoy</span>}
+      </div>
+      <div className="p-2 space-y-1.5">
+        {items.map((g) => {
+          const c = colorDe(g.materia);
+          return (
+            <button key={g.key} onClick={() => setGrupoSel(g)} className="w-full text-left px-3 py-2.5 rounded-lg flex items-center gap-3 hover:brightness-95"
+              style={{ background: c.bg, boxShadow: `inset 3px 0 0 ${c.dot}`, opacity: iso < hoyISO ? 0.55 : 1 }}>
+              <span className="text-sm font-bold tabular-nums w-12 shrink-0" style={{ color: c.text }}>{g.hora}</span>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium truncate" style={{ color: t.text }}>{g.materia}{g.mesas.length > 1 && <span className="font-normal" style={{ color: t.textMut }}> · {g.mesas.length} mesas</span>}</div>
+                <div className="text-xs truncate" style={{ color: t.textMut }}>{g.ubicacion} · {g.llamado}</div>
+              </div>
+              <span className="hidden sm:inline text-xs shrink-0" style={{ color: t.textMut }}>Ver alumnos →</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-4">
+      {error && <ErrorBanner message={error} onDismiss={() => setError("")} />}
+
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="text-lg font-bold" style={{ color: t.text }}>Exámenes finales</h2>
+          <p className="text-xs mt-0.5" style={{ color: t.textMut }}>
+            {proximo ? <>Próxima: {fechaLarga(proximo.fechaISO)} {proximo.hora} · {proximo.materia}</> : "No hay mesas próximas"}
+          </p>
+        </div>
+        <div className="flex gap-1 p-1 rounded-xl" style={{ background: t.surface }}>
+          {[{ id: "mes", l: "Mes", i: ico.cal }, { id: "lista", l: "Lista", i: ico.list }].map((v) => (
+            <button key={v.id} onClick={() => setVista(v.id)} className="px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5"
+              style={vista === v.id ? { background: t.greenBg, color: t.greenText } : { color: t.textMut }}>{v.i} {v.l}</button>
+          ))}
+        </div>
+      </div>
+
+      {materias.length > 1 && (
+        <div className="flex flex-wrap gap-1.5">
+          {materias.map((m) => {
+            const c = colorDe(m); const off = ocultas.has(m);
+            return (
+              <button key={m} onClick={() => toggleMateria(m)} className="px-2.5 py-1 rounded-full text-xs flex items-center gap-1.5"
+                style={off ? { background: t.ghost, color: t.textFaint, textDecoration: "line-through" } : { background: c.bg, color: c.text, boxShadow: `inset 0 0 0 1px ${c.border}` }}>
+                <span className="w-2 h-2 rounded-full" style={{ background: off ? t.textFaint : c.dot }} />{m}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className="flex items-center justify-between">
+        <button onClick={() => moverMes(-1)} className="px-3 py-1.5 rounded-lg text-sm" style={{ background: t.ghost, color: t.ghostText }}>‹</button>
+        <div className="flex items-center gap-2">
+          <span className="text-base font-bold" style={{ color: t.text }}>{MESES[mes.getMonth()]} {mes.getFullYear()}</span>
+          {loadingMes && <Spinner size={14} />}
+          {mesKey(mes) !== mesKey(hoy) && (
+            <button onClick={() => { setMes(new Date(hoy.getFullYear(), hoy.getMonth(), 1)); setDiaSel(null); }} className="px-2 py-0.5 rounded-md text-xs" style={{ background: t.greenBg, color: t.greenText }}>Hoy</button>
+          )}
+        </div>
+        <button onClick={() => moverMes(1)} className="px-3 py-1.5 rounded-lg text-sm" style={{ background: t.ghost, color: t.ghostText }}>›</button>
+      </div>
+
+      {vista === "mes" ? (
+        <>
+          <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${t.surfaceBorder}` }}>
+            <div className="grid grid-cols-7" style={{ background: t.ghost }}>
+              {DIAS_CORTOS.map((d) => <div key={d} className="px-1 py-1.5 text-center text-xs font-semibold" style={{ color: t.textMut }}>{d}</div>)}
+            </div>
+            <div className="grid grid-cols-7">
+              {celdas.map((d, i) => {
+                if (!d) return <div key={i} className="min-h-[64px] sm:min-h-[104px]" style={{ background: t.surface, borderTop: `1px solid ${t.surfaceBorder}`, borderLeft: i % 7 ? `1px solid ${t.surfaceBorder}` : "none", opacity: 0.5 }} />;
+                const iso = isoOf(d); const items = porDia[iso] || [];
+                const esHoy = iso === hoyISO; const sel = iso === diaSel;
+                return (
+                  <div key={i} onClick={() => setDiaSel(sel ? null : iso)} className="min-h-[64px] sm:min-h-[104px] p-1 space-y-0.5 cursor-pointer min-w-0"
+                    style={{ borderTop: `1px solid ${t.surfaceBorder}`, borderLeft: i % 7 ? `1px solid ${t.surfaceBorder}` : "none", background: sel ? t.greenBg : "transparent" }}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs w-6 h-6 flex items-center justify-center rounded-full font-medium"
+                        style={esHoy ? { background: "#22c55e", color: "#fff" } : { color: iso < hoyISO ? t.textFaint : t.textSec }}>{d.getDate()}</span>
+                      {items.length > 0 && <span className="sm:hidden text-[10px] font-semibold" style={{ color: t.greenText }}>{items.length}</span>}
+                    </div>
+                    <div className="hidden sm:block space-y-0.5">
+                      {items.slice(0, 3).map((g) => <Chip key={g.key} g={g} compact />)}
+                      {items.length > 3 && <div className="text-[11px] px-1" style={{ color: t.textMut }}>+{items.length - 3} más</div>}
+                    </div>
+                    <div className="sm:hidden flex flex-wrap gap-0.5">
+                      {items.slice(0, 6).map((g) => <span key={g.key} className="w-1.5 h-1.5 rounded-full" style={{ background: colorDe(g.materia).dot }} />)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {diaSel && (porDia[diaSel]?.length
+            ? <ListaDia iso={diaSel} items={porDia[diaSel]} />
+            : <p className="text-sm text-center py-2" style={{ color: t.textMut }}>Sin mesas el {fechaLarga(diaSel).toLowerCase()}</p>)}
+          {!diaSel && <p className="text-xs text-center" style={{ color: t.textMut }}>Tocá un día para ver el detalle, o una mesa para ver sus alumnos.</p>}
+        </>
+      ) : (
+        <div className="space-y-3">
+          {gruposMes.length === 0 && <p className="text-sm text-center py-8" style={{ color: t.textMut }}>No hay mesas en {MESES[mes.getMonth()].toLowerCase()}.</p>}
+          {[...new Set(gruposMes.map((g) => g.fechaISO))].map((iso) => <ListaDia key={iso} iso={iso} items={porDia[iso]} />)}
+        </div>
+      )}
+
+      {grupoSel && (
+        <MesaModal grupo={grupoSel} comisiones={comisiones} color={colorDe(grupoSel.materia)} cache={alumnosCache} onClose={() => setGrupoSel(null)} />
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [logged, setLogged] = useState(!!api.getSession());
   const [nombre, setNombre] = useState(api.getNombre() || "");
   const [selComs, setSelComs] = useState(null);
+  const [seccion, setSeccion] = useState("cursada");
   const [dark, setDark] = useState(false);
   const t = dark ? themes.dark : themes.light;
   const handleLogin = (name, session) => { setNombre(name); setLogged(true); };
-  const logout = () => { api.clearSession(); setLogged(false); setSelComs(null); setNombre(""); };
+  const logout = () => { api.clearSession(); setLogged(false); setSelComs(null); setNombre(""); setSeccion("cursada"); };
   return (
     <ThemeCtx.Provider value={t}>
       <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
@@ -1500,7 +1896,17 @@ export default function App() {
             </div>
           </header>
           <main className="max-w-6xl mx-auto px-4 py-6">
-            {selComs ? <Unified coms={selComs} onBack={() => setSelComs(null)} /> : <Dash onGo={setSelComs} />}
+            {selComs ? <Unified coms={selComs} onBack={() => setSelComs(null)} /> : (
+              <div className="space-y-5">
+                <div className="flex gap-1 p-1 rounded-xl w-full sm:w-auto sm:inline-flex" style={{ background: t.surface }}>
+                  {[{ id: "cursada", l: "Comisiones", i: ico.clip }, { id: "finales", l: "Finales", i: ico.cal }].map((s) => (
+                    <button key={s.id} onClick={() => setSeccion(s.id)} className="flex-1 sm:flex-none px-4 py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5"
+                      style={seccion === s.id ? { background: t.greenBg, color: t.greenText } : { color: t.textMut }}>{s.i} {s.l}</button>
+                  ))}
+                </div>
+                {seccion === "finales" ? <Finales dark={dark} /> : <Dash onGo={setSelComs} />}
+              </div>
+            )}
           </main>
         </div>
       )}

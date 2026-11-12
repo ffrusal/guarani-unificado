@@ -152,3 +152,8 @@ export async function reabrirEvaluacion(reabrirHash) {
 export async function cerrarEvaluacion(cerrarHash) {
   return apiFetch(`/api/notas/${cerrarHash}/cerrar`, { method: "POST" });
 }
+// ── FINALES (mesas de examen) ──
+export async function getFinales(desde, hasta) {
+  const qs = desde && hasta ? `?desde=${encodeURIComponent(desde)}&hasta=${encodeURIComponent(hasta)}` : "";
+  return apiFetch(`/api/finales${qs}`);
+}
